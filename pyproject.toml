@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "highspeed-uuv-kinematic"
+version = "0.1.0"
+description = "Speed-constrained kinematic UUV planning and validation"
+requires-python = ">=3.10"
+dependencies = [
+  "gymnasium==1.2.1",
+  "numpy==1.26.4",
+  "matplotlib==3.8.4",
+  "scipy==1.13.1",
+  "stable-baselines3==2.7.0",
+  "torch==2.5.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["kinematic_uuv*", "training*"]
