@@ -1,4 +1,6 @@
 """Speed-constrained three-dimensional kinematic UUV environment."""
+from collections import deque
+
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
@@ -31,16 +33,28 @@ class KinematicUUVEnv(gym.Env):
         min_turn_radius=20.0,
         max_pitch_rate=0.20,
         max_pitch=0.35,
-        goal_distance_range=(120.0, 450.0),
+        goal_distance_range=(650.0, 900.0),
         obstacle_count_range=(20, 32),
         obstacle_radius_range=(4.0, 22.0),
         obstacle_distribution="uniform",
         goal_radius=5.0,
-        planning_bounds=((-100.0, -350.0, 0.0),
-                         (700.0, 350.0, 100.0)),
+        planning_bounds=((-100.0, -750.0, 0.0),
+                         (1100.0, 750.0, 100.0)),
         dijkstra_resolution=8.0,
         vertical_cost_scale=2.0,
+        dijkstra_potential_scale=100.0,
+        use_dijkstra=True,
+        include_path_observation=True,
+        reward_mode="dijkstra",
+        distance_potential_scale=250.0,
+        reward_gamma=0.999,
         path_refresh_steps=5,
+        obstacle_motion="static",
+        obstacle_speed_range=(1.0 * KNOT_MPS, 10.0 * KNOT_MPS),
+        obstacle_turn_rate_rad_s=0.15,
+        dijkstra_replan_steps=10,
+        sonar_history_length=0,
+        sonar_history_stride=1,
         sensor_backend="cpu",
         sensor_device="cuda",
     ):
@@ -79,7 +93,54 @@ class KinematicUUVEnv(gym.Env):
         )
         self.dijkstra_resolution = float(dijkstra_resolution)
         self.vertical_cost_scale = float(vertical_cost_scale)
+        self.dijkstra_potential_scale = float(dijkstra_potential_scale)
+        if self.dijkstra_potential_scale <= 0.0:
+            raise ValueError("dijkstra_potential_scale must be positive")
+        self.use_dijkstra = bool(use_dijkstra)
+        self.include_path_observation = bool(include_path_observation)
+        if self.include_path_observation and not self.use_dijkstra:
+            raise ValueError(
+                "path observation requires Dijkstra guidance to be enabled"
+            )
+        self.reward_mode = str(reward_mode)
+        if self.reward_mode not in {"dijkstra", "euclidean"}:
+            raise ValueError("reward_mode must be 'dijkstra' or 'euclidean'")
+        if self.reward_mode == "dijkstra" and not self.use_dijkstra:
+            raise ValueError(
+                "Dijkstra reward requires Dijkstra guidance to be enabled"
+            )
+        self.distance_potential_scale = float(distance_potential_scale)
+        if self.distance_potential_scale <= 0.0:
+            raise ValueError("distance_potential_scale must be positive")
+        self.reward_gamma = float(reward_gamma)
+        if not 0.0 < self.reward_gamma <= 1.0:
+            raise ValueError("reward_gamma must be in (0, 1]")
         self.path_refresh_steps = max(1, int(path_refresh_steps))
+        self.obstacle_motion = str(obstacle_motion)
+        if self.obstacle_motion not in {"static", "random"}:
+            raise ValueError("obstacle_motion must be 'static' or 'random'")
+        self.obstacle_speed_min, self.obstacle_speed_max = map(
+            float, obstacle_speed_range
+        )
+        if (self.obstacle_speed_min < 0.0
+                or self.obstacle_speed_max < self.obstacle_speed_min):
+            raise ValueError("invalid obstacle speed range")
+        if self.obstacle_speed_max > self.speed_max:
+            raise ValueError(
+                "maximum obstacle speed must not exceed UUV maximum speed"
+            )
+        self.obstacle_turn_rate_rad_s = float(obstacle_turn_rate_rad_s)
+        if self.obstacle_turn_rate_rad_s < 0.0:
+            raise ValueError("obstacle turn rate must be nonnegative")
+        self.dijkstra_replan_steps = int(dijkstra_replan_steps)
+        if self.dijkstra_replan_steps < 0:
+            raise ValueError("dijkstra_replan_steps must be nonnegative")
+        self.sonar_history_length = int(sonar_history_length)
+        if self.sonar_history_length < 0:
+            raise ValueError("sonar_history_length must be nonnegative")
+        self.sonar_history_stride = int(sonar_history_stride)
+        if self.sonar_history_stride < 1:
+            raise ValueError("sonar_history_stride must be positive")
         self.sensor_backend = str(sensor_backend)
         self.sensor_device = str(sensor_device)
         if self.sensor_backend == "gpu":
@@ -102,19 +163,39 @@ class KinematicUUVEnv(gym.Env):
         self.cruise_speed = float(np.mean(self.cruise_speed_range))
         self.cruise_speed_override = None
         self.steps = 0
+        self.obstacle_velocities = np.empty((0, 3), dtype=float)
+        self.obstacle_speeds = np.empty((0,), dtype=float)
+        history_buffer_length = (
+            (self.sonar_history_length - 1) * self.sonar_history_stride + 1
+            if self.sonar_history_length > 0 else 1
+        )
+        self._sonar_history = deque(maxlen=history_buffer_length)
         self._cost_field = None
         self._cost_origin = None
         self._cost_occupancy = None
         self._cached_path = None
 
         self.action_space = spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
-        self.observation_space = spaces.Dict({
+        observation_spaces = {
             "sonar": spaces.Box(0.0, 1.0, shape=self.sonar.observation_shape,
                                dtype=np.float32),
             "target": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
-            "path": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
             "motion": spaces.Box(-np.inf, np.inf, shape=(7,), dtype=np.float32),
-        })
+        }
+        if self.include_path_observation:
+            observation_spaces["path"] = spaces.Box(
+                -np.inf, np.inf, shape=(5,), dtype=np.float32
+            )
+        if self.sonar_history_length > 0:
+            observation_spaces["sonar_history"] = spaces.Box(
+                0.0, 1.0,
+                shape=(
+                    self.sonar_history_length,
+                    *self.sonar.observation_shape,
+                ),
+                dtype=np.float32,
+            )
+        self.observation_space = spaces.Dict(observation_spaces)
 
     @staticmethod
     def _wrap_angle(angle):
@@ -138,15 +219,66 @@ class KinematicUUVEnv(gym.Env):
         lower, upper = self.planning_bounds
         return bool(np.any(position < lower) or np.any(position > upper))
 
+    def _initialize_obstacle_motion(self):
+        if self.obstacle_motion == "static" or not self.obstacles:
+            self.obstacle_velocities = np.empty((0, 3), dtype=float)
+            self.obstacle_speeds = np.empty((0,), dtype=float)
+            return
+        count = len(self.obstacles)
+        self.obstacle_speeds = self.np_random.uniform(
+            self.obstacle_speed_min,
+            self.obstacle_speed_max,
+            size=count,
+        )
+        directions = self.np_random.normal(size=(count, 3))
+        norms = np.linalg.norm(directions, axis=1)
+        norms = np.maximum(norms, 1e-9)
+        directions /= norms[:, None]
+        self.obstacle_velocities = directions * self.obstacle_speeds[:, None]
+
+    def _update_obstacles(self):
+        if self.obstacle_motion == "static" or not self.obstacles:
+            return
+        noise = self.np_random.normal(
+            size=self.obstacle_velocities.shape
+        ) * self.obstacle_turn_rate_rad_s * np.sqrt(self.dt)
+        directions = self.obstacle_velocities + noise
+        norms = np.linalg.norm(directions, axis=1)
+        norms = np.maximum(norms, 1e-9)
+        self.obstacle_velocities = (
+            directions / norms[:, None]
+        ) * self.obstacle_speeds[:, None]
+
+        lower, upper = self.planning_bounds
+        updated = []
+        for index, (center, radius) in enumerate(self.obstacles):
+            center = center + self.obstacle_velocities[index] * self.dt
+            low = lower + radius
+            high = upper - radius
+            for axis in range(3):
+                if center[axis] < low[axis]:
+                    center[axis] = low[axis]
+                    self.obstacle_velocities[index, axis] *= -1.0
+                elif center[axis] > high[axis]:
+                    center[axis] = high[axis]
+                    self.obstacle_velocities[index, axis] *= -1.0
+            updated.append((center, radius))
+        self.obstacles = updated
+        if hasattr(self.sonar, "set_obstacles"):
+            self.sonar.set_obstacles(self.obstacles)
+
     def _sample_scene(self):
         start = np.array([0.0, 0.0, 10.0], dtype=float)
         distance = self.np_random.uniform(*self.goal_distance_range)
         yaw = self.np_random.uniform(-np.pi / 4.0, np.pi / 4.0)
         pitch = self.np_random.uniform(-np.pi / 12.0, np.pi / 12.0)
+        depth = np.clip(start[2] - distance * np.sin(pitch), 8.0, 75.0)
+        # Preserve the sampled 3D distance after limiting the goal depth.
+        horizontal_distance = np.sqrt(distance**2 - (depth - start[2])**2)
         self.goal = np.array([
-            distance * np.cos(pitch) * np.cos(yaw),
-            distance * np.cos(pitch) * np.sin(yaw),
-            np.clip(start[2] - distance * np.sin(pitch), 8.0, 75.0),
+            horizontal_distance * np.cos(yaw),
+            horizontal_distance * np.sin(yaw),
+            depth,
         ])
         if self.cruise_speed_override is None:
             self.cruise_speed = float(self.np_random.uniform(
@@ -238,6 +370,13 @@ class KinematicUUVEnv(gym.Env):
         outside += np.maximum(position - upper, 0.0)
         return max_cost + float(np.linalg.norm(outside))
 
+    def _dijkstra_potential(self, position):
+        """Potential is negative cost-to-go under the current cost field."""
+        cost = self._dijkstra_cost(position)
+        if not np.isfinite(cost):
+            return float("-inf")
+        return -cost / self.dijkstra_potential_scale
+
     def _plan_path(self, start, max_points=500):
         if self._cost_field is None:
             return np.empty((0, 3), dtype=float)
@@ -328,6 +467,12 @@ class KinematicUUVEnv(gym.Env):
             float(np.clip(cross_track / 30.0, -1.0, 1.0)),
         ], dtype=np.float32)
 
+    def teacher_path_observation(self):
+        """Return Dijkstra path features for teacher labels only."""
+        if not self.use_dijkstra:
+            return np.zeros(5, dtype=np.float32)
+        return self._path_observation(self._current_path())
+
     def _observe(self, path=None):
         eta = np.array([
             self.state["position"][0], self.state["position"][1],
@@ -335,6 +480,13 @@ class KinematicUUVEnv(gym.Env):
             self.state["yaw"],
         ])
         sonar = self.sonar.observe(eta, self.obstacles)
+        if self.sonar_history_length > 0:
+            self._sonar_history.append(sonar.copy())
+            frames = list(self._sonar_history)
+            frames = [frames[0]] * (
+                self._sonar_history.maxlen - len(frames)
+            ) + frames
+            frames = frames[::self.sonar_history_stride]
         delta = self.goal - self.state["position"]
         distance = float(np.linalg.norm(delta))
         horizontal = float(np.hypot(delta[0], delta[1]))
@@ -347,9 +499,8 @@ class KinematicUUVEnv(gym.Env):
             target_pitch,
             target_yaw,
             self.cruise_speed - self.state["speed"],
-            float(np.clip(distance / 500.0, 0.0, 1.0)),
+            float(np.clip(distance / 1000.0, 0.0, 1.0)),
         ], dtype=np.float32)
-        path = self._current_path() if path is None else path
         motion = np.array([
             self.state["speed"],
             self.cruise_speed,
@@ -359,12 +510,17 @@ class KinematicUUVEnv(gym.Env):
             self.state["pitch"],
             self.state["pitch_rate"],
         ], dtype=np.float32)
-        return {
+        observation = {
             "sonar": sonar,
             "target": target,
-            "path": self._path_observation(path),
             "motion": motion,
         }
+        if self.include_path_observation:
+            path = self._current_path() if path is None else path
+            observation["path"] = self._path_observation(path)
+        if self.sonar_history_length > 0:
+            observation["sonar_history"] = np.stack(frames)
+        return observation
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -377,14 +533,23 @@ class KinematicUUVEnv(gym.Env):
             "pitch_rate": 0.0,
         }
         self.steps = 0
-        for _attempt in range(10):
-            self._sample_scene()
-            self._build_cost_field()
-            if np.isfinite(self._dijkstra_cost(self.state["position"])):
-                break
+        self._sonar_history.clear()
+        if self.use_dijkstra:
+            for _attempt in range(10):
+                self._sample_scene()
+                self._build_cost_field()
+                if np.isfinite(self._dijkstra_cost(self.state["position"])):
+                    break
+            else:
+                raise RuntimeError("failed to generate a reachable obstacle scene")
+            self._cached_path = self._plan_path(self.state["position"])
         else:
-            raise RuntimeError("failed to generate a reachable obstacle scene")
-        self._cached_path = self._plan_path(self.state["position"])
+            self._sample_scene()
+            self._cost_field = None
+            self._cost_origin = None
+            self._cost_occupancy = None
+            self._cached_path = None
+        self._initialize_obstacle_motion()
         if hasattr(self.sonar, "set_obstacles"):
             self.sonar.set_obstacles(self.obstacles)
         return self._observe(), {}
@@ -404,8 +569,11 @@ class KinematicUUVEnv(gym.Env):
         )
 
     def _desired_speed(self, path, distance):
-        yaw_error = abs(self._path_observation(path)[1])
-        turn_factor = max(0.35, float(np.cos(yaw_error)))
+        if path is None or len(path) < 2:
+            turn_factor = 1.0
+        else:
+            yaw_error = abs(self._path_observation(path)[1])
+            turn_factor = max(0.35, float(np.cos(yaw_error)))
         desired = self.cruise_speed * turn_factor
         brake_distance = 40.0 + self.state["speed"]
         if distance < brake_distance:
@@ -415,10 +583,17 @@ class KinematicUUVEnv(gym.Env):
 
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
-        path = self._current_path()
-        previous_observation = self._observe(path)
         previous_position = self.state["position"].copy()
         old_distance = float(np.linalg.norm(self.goal - previous_position))
+        self._update_obstacles()
+        if (self.use_dijkstra
+                and self.obstacle_motion == "random"
+                and self.dijkstra_replan_steps > 0
+                and self.steps > 0
+                and self.steps % self.dijkstra_replan_steps == 0):
+            self._build_cost_field()
+            self._cached_path = None
+        path = self._current_path() if self.use_dijkstra else None
 
         desired_speed = self.speed_min + 0.5 * (action[0] + 1.0) * (
             self.speed_max - self.speed_min
@@ -487,30 +662,64 @@ class KinematicUUVEnv(gym.Env):
         ) <= self.goal_radius
         out_of_bounds = self._outside_bounds(position)
 
-        cost_previous = self._dijkstra_cost(previous_position)
-        cost_current = self._dijkstra_cost(position)
-        if np.isfinite(cost_previous) and np.isfinite(cost_current):
-            path_progress = float(np.clip(cost_previous - cost_current, -5.0, 5.0))
-        else:
-            path_progress = -1.0 if out_of_bounds else 0.0
         direct_progress = float(np.clip(old_distance - distance, -2.0, 2.0))
+        if self.reward_mode == "dijkstra":
+            cost_previous = self._dijkstra_cost(previous_position)
+            cost_current = self._dijkstra_cost(position)
+            if np.isfinite(cost_previous) and np.isfinite(cost_current):
+                potential_previous = self._dijkstra_potential(previous_position)
+                potential_current = self._dijkstra_potential(position)
+                dijkstra_shaping = (
+                    self.reward_gamma * potential_current - potential_previous
+                )
+                path_progress = (
+                    dijkstra_shaping * self.dijkstra_potential_scale
+                )
+            else:
+                path_progress = -1.0 if out_of_bounds else 0.0
+                potential_current = float("-inf")
+                dijkstra_shaping = 0.0
+            distance_shaping = 0.0
+            distance_potential = -distance / self.distance_potential_scale
+        else:
+            path_progress = 0.0
+            potential_current = 0.0
+            dijkstra_shaping = 0.0
+            potential_previous = (
+                -old_distance / self.distance_potential_scale
+            )
+            distance_potential = -distance / self.distance_potential_scale
+            distance_shaping = (
+                self.reward_gamma * distance_potential - potential_previous
+            )
         observation = self._observe()
-        alignment_error = abs(float(observation["path"][1]))
+        alignment_error = (
+            abs(float(self._path_observation(path)[1]))
+            if path is not None and len(path) >= 2 else 0.0
+        )
         desired_speed = self._desired_speed(path, distance)
         speed_error = abs(self.state["speed"] - desired_speed) / max(
             self.cruise_speed, 1.0
         )
         goal_proximity = 1.0 - float(np.clip(distance / 100.0, 0.0, 1.0))
         safety_penalty = max(0.0, 15.0 - clearance) / 15.0
-        reward = (
-            8.0 * path_progress
-            + 2.0 * direct_progress
-            - 0.5 * alignment_error
-            - 0.3 * speed_error
-            - 0.2 * safety_penalty
-            - 0.02
-            + 2.0 * goal_proximity
-        )
+        if self.reward_mode == "dijkstra":
+            reward = (
+                dijkstra_shaping
+                + 2.0 * direct_progress
+                - 0.5 * alignment_error
+                - 0.3 * speed_error
+                - 0.2 * safety_penalty
+                - 0.02
+                + 2.0 * goal_proximity
+            )
+        else:
+            reward = (
+                distance_shaping
+                - 0.3 * speed_error
+                - 0.2 * safety_penalty
+                - 0.02
+            )
         if reached:
             reward += 100.0
         if collided:
@@ -529,13 +738,21 @@ class KinematicUUVEnv(gym.Env):
             "pitch_rad": self.state["pitch"],
             "clearance_m": float(clearance),
             "path_progress": path_progress,
+            "dijkstra_shaping": float(dijkstra_shaping),
+            "dijkstra_potential": float(potential_current),
+            "distance_shaping": float(distance_shaping),
+            "distance_potential": float(distance_potential),
+            "direct_progress": direct_progress,
             "alignment_error": alignment_error,
+            "reward_mode": self.reward_mode,
+            "obstacle_motion": self.obstacle_motion,
+            "max_obstacle_speed_mps": float(self.obstacle_speeds.max())
+                if self.obstacle_speeds.size else 0.0,
         }
         terminated = bool(collided or reached or out_of_bounds)
         truncated = bool(self.steps >= self.max_steps)
         if truncated and not terminated:
             reward -= 50.0
-        self._previous_observation = previous_observation
         return observation, float(reward), terminated, truncated, info
 
     def close(self):

@@ -22,7 +22,9 @@ def _load_config(model_path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _make_env(config, episode_steps):
+def _make_env(config, episode_steps, moving_obstacles=False,
+              obstacle_speed_range=(KNOT_MPS, 10.0 * KNOT_MPS),
+              obstacle_turn_rate_rad_s=0.15):
     bounds = config.get("planning_bounds_m")
     kwargs = dict(
         dt=config.get("dt", 0.1),
@@ -52,6 +54,22 @@ def _make_env(config, episode_steps):
         goal_distance_range=tuple(config.get("goal_distance_range_m", [120, 450])),
         dijkstra_resolution=config.get("dijkstra_resolution_m", 8.0),
         path_refresh_steps=config.get("path_refresh_steps", 5),
+        dijkstra_potential_scale=config.get("dijkstra_potential_scale", 100.0),
+        use_dijkstra=config.get("use_dijkstra", True),
+        include_path_observation=config.get(
+            "include_path_observation", True
+        ),
+        reward_mode=config.get("reward_mode", "dijkstra"),
+        distance_potential_scale=config.get(
+            "distance_potential_scale", 250.0
+        ),
+        reward_gamma=config.get("gamma", 0.999),
+        obstacle_motion="random" if moving_obstacles else "static",
+        obstacle_speed_range=obstacle_speed_range,
+        obstacle_turn_rate_rad_s=obstacle_turn_rate_rad_s,
+        dijkstra_replan_steps=config.get("dijkstra_replan_steps", 0),
+        sonar_history_length=config.get("sonar_history_length", 0),
+        sonar_history_stride=config.get("sonar_history_stride", 1),
     )
     if bounds is not None:
         kwargs["planning_bounds"] = (bounds[0], bounds[1])
@@ -74,6 +92,13 @@ def _save_trajectory(path, record):
         seed=np.asarray(record["seed"]),
         target_speed_knots=np.asarray(record["target_speed_knots"]),
         dt=np.asarray(record.get("dt", 0.1)),
+        obstacle_positions=np.asarray(record.get("obstacle_positions", [])),
+        obstacles_initial=np.asarray(record.get("obstacles_initial", [])),
+        obstacles_final=np.asarray(record.get("obstacles_final", [])),
+        obstacle_motion=np.asarray(record.get("obstacle_motion", "static")),
+        max_obstacle_speed_mps=np.asarray(
+            record.get("max_obstacle_speed_mps", 0.0)
+        ),
     )
 
 
@@ -85,6 +110,12 @@ def run_episode(env, model, seed, speed_knots):
     speed = [env.state["speed"]]
     actions = []
     yaw_rate = [env.state["yaw_rate"]]
+    obstacles_initial = np.asarray([
+        [*center, radius] for center, radius in env.obstacles
+    ])
+    obstacle_positions = [
+        np.asarray([center for center, _ in env.obstacles], dtype=float)
+    ]
     max_clearance = float("inf")
     total_reward = 0.0
     steps = 0
@@ -97,6 +128,10 @@ def run_episode(env, model, seed, speed_knots):
         rotation.append([0.0, env.state["pitch"], env.state["yaw"]])
         speed.append(env.state["speed"])
         yaw_rate.append(env.state["yaw_rate"])
+        if env.obstacle_motion != "static":
+            obstacle_positions.append(np.asarray(
+                [center for center, _ in env.obstacles], dtype=float
+            ))
         max_clearance = min(max_clearance, float(info["clearance_m"]))
         total_reward += reward
         steps += 1
@@ -121,6 +156,10 @@ def run_episode(env, model, seed, speed_knots):
             np.asarray(speed) * np.abs(np.asarray(yaw_rate))
         )),
         "max_abs_pitch_rad": float(np.max(np.abs(np.asarray(rotation)[:, 1]))),
+        "obstacle_motion": env.obstacle_motion,
+        "max_obstacle_speed_mps": float(
+            env.obstacle_speeds.max()
+        ) if env.obstacle_speeds.size else 0.0,
         "path_length_m": float(np.linalg.norm(
             np.diff(np.asarray(position), axis=0), axis=1
         ).sum()),
@@ -136,6 +175,16 @@ def run_episode(env, model, seed, speed_knots):
         "obstacles": np.asarray([
             [*center, radius] for center, radius in env.obstacles
         ]),
+        "obstacles_initial": obstacles_initial,
+        "obstacles_final": np.asarray([
+            [*center, radius] for center, radius in env.obstacles
+        ]),
+        "obstacle_positions": np.asarray(obstacle_positions),
+        "obstacle_motion": env.obstacle_motion,
+        "max_obstacle_speed_mps": (
+            float(env.obstacle_speeds.max())
+            if env.obstacle_speeds.size else 0.0
+        ),
         "cruise_speed_mps": env.cruise_speed,
         "success": bool(info.get("reached", False)),
         "seed": seed,
@@ -210,24 +259,69 @@ def main():
         default=Path("output_model/kinematic_eval"),
     )
     parser.add_argument("--episode-steps", type=int, default=1000)
-    parser.add_argument("--episodes-per-speed", type=int, default=50)
+    parser.add_argument("--episodes-per-speed", type=int, default=100)
     parser.add_argument("--speeds-knots", type=float, nargs="+",
-                        default=[10.0, 20.0, 30.0, 40.0, 50.0])
-    parser.add_argument("--seed", type=int, default=0)
+                        default=[50.0])
+    parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--save-trajectories", action=argparse.BooleanOptionalAction,
                         default=True)
     parser.add_argument("--device", default="cuda",
                         help="PyTorch device: cuda, cuda:0, cpu, or auto")
+    parser.add_argument(
+        "--moving-obstacles", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable random obstacle motion during evaluation only",
+    )
+    parser.add_argument(
+        "--obstacle-speed-min-knots", type=float, default=1.0,
+        help="minimum obstacle speed in knots",
+    )
+    parser.add_argument(
+        "--obstacle-speed-max-knots", type=float, default=10.0,
+        help="maximum obstacle speed in knots",
+    )
+    parser.add_argument("--obstacle-turn-rate-rad-s", type=float, default=0.15)
+    parser.add_argument("--dijkstra-replan-steps", type=int)
     args = parser.parse_args()
     if args.episodes_per_speed <= 0 or args.episode_steps <= 0:
         parser.error("episode counts must be positive")
 
     config = _load_config(args.model)
-    if config.get("observation_type") != "kinematic_sonar_path_v1":
-        parser.error("model is not a kinematic_sonar_path_v1 policy")
+    observation_type = config.get("observation_type")
+    if observation_type not in {
+        "kinematic_sonar_path_v1",
+        "kinematic_sonar_lstm_path_v2",
+        "kinematic_sonar_goal_v2",
+        "kinematic_sonar_lstm_goal_v3",
+    }:
+        parser.error("model uses an unsupported observation configuration")
     device = resolve_device(args.device)
     configure_torch(device)
-    env = _make_env(config, args.episode_steps)
+    if args.obstacle_speed_min_knots < 0.0 or (
+            args.obstacle_speed_max_knots < args.obstacle_speed_min_knots):
+        parser.error("invalid obstacle speed range")
+    if args.obstacle_speed_max_knots > 50.0:
+        parser.error("obstacle-speed-max-knots must not exceed 50 knots")
+    if args.obstacle_speed_max_knots * KNOT_MPS > config.get(
+            "speed_max_mps", 50.0 * KNOT_MPS):
+        parser.error(
+            "obstacle-speed-max-knots must not exceed UUV maximum speed"
+        )
+    if args.obstacle_turn_rate_rad_s < 0.0:
+        parser.error("obstacle-turn-rate-rad-s must be nonnegative")
+    if args.dijkstra_replan_steps is not None:
+        if args.dijkstra_replan_steps < 0:
+            parser.error("dijkstra-replan-steps must be nonnegative")
+        config["dijkstra_replan_steps"] = args.dijkstra_replan_steps
+    env = _make_env(
+        config, args.episode_steps,
+        moving_obstacles=args.moving_obstacles,
+        obstacle_speed_range=(
+            args.obstacle_speed_min_knots * KNOT_MPS,
+            args.obstacle_speed_max_knots * KNOT_MPS,
+        ),
+        obstacle_turn_rate_rad_s=args.obstacle_turn_rate_rad_s,
+    )
     model = PPO.load(str(args.model), device=str(device))
     if model.observation_space != env.observation_space:
         raise ValueError("model observation space differs from environment")

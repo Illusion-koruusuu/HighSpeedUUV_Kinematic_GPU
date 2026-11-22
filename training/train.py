@@ -1,5 +1,6 @@
 """Train a speed-constrained kinematic UUV with BC initialization and PPO."""
 import argparse
+import gc
 import json
 import math
 import os
@@ -17,19 +18,126 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from kinematic_uuv.env import KNOT_MPS, KinematicUUVEnv
 from kinematic_uuv.policy import BoundedActorCriticPolicy, SonarCNNFeaturesExtractor
 from kinematic_uuv.runtime import configure_torch, resolve_device
+from training.dagger import collect_dagger_dataset
 from training.teacher_data import collect_teacher_dataset
 
 
 ACTION_DISTRIBUTION = "squashed_diag_gaussian"
 OBSERVATION_TYPE = "kinematic_sonar_path_v1"
+OBSERVATION_TYPE_LSTM = "kinematic_sonar_lstm_path_v2"
+OBSERVATION_TYPE_GOAL = "kinematic_sonar_goal_v2"
+OBSERVATION_TYPE_LSTM_GOAL = "kinematic_sonar_lstm_goal_v3"
 
 
 def knots(values):
     return tuple(float(value) * KNOT_MPS for value in values)
 
 
+def _observation_type(sonar_history_length,
+                      include_path_observation=True):
+    return (
+        OBSERVATION_TYPE_LSTM_GOAL
+        if sonar_history_length > 0 and not include_path_observation
+        else OBSERVATION_TYPE_GOAL
+        if not include_path_observation
+        else OBSERVATION_TYPE_LSTM
+        if sonar_history_length > 0
+        else OBSERVATION_TYPE
+    )
+
+
 def _environment(cruise_speed_range, **kwargs):
     return KinematicUUVEnv(cruise_speed_range=cruise_speed_range, **kwargs)
+
+
+def _run_metadata(args, env, full_speed_range, device):
+    return {
+        "algorithm": "PPO",
+        "policy_mode": (
+            "resumed_ppo" if args.resume_model is not None
+            else "static_bc_to_dynamic_residual_ppo"
+            if args.bc_steps and args.residual_policy
+            else "static_bc_to_dynamic_ppo" if args.bc_steps
+            else "pure_ppo"
+        ),
+        "policy_action_distribution": ACTION_DISTRIBUTION,
+        "observation_type": _observation_type(
+            args.sonar_history_length, env.include_path_observation
+        ),
+        "training_status": "running",
+        "bc_obstacle_motion": "static" if args.bc_steps else None,
+        "ppo_obstacle_motion": env.obstacle_motion,
+        "ppo_uses_dijkstra": env.use_dijkstra,
+        "include_path_observation": env.include_path_observation,
+        "ppo_reward_mode": env.reward_mode,
+        "distance_potential_scale": env.distance_potential_scale,
+        "training_args": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "timesteps": args.timesteps,
+        "timesteps_after_run": 0,
+        "num_envs": args.num_envs,
+        "n_steps": args.n_steps,
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "bc_finetune_learning_rate": args.bc_finetune_learning_rate,
+        "episode_steps": args.episode_steps,
+        "dt": env.dt,
+        "speed_min_mps": env.speed_min,
+        "speed_max_mps": env.speed_max,
+        "cruise_speed_range_mps": list(full_speed_range),
+        "max_accel_mps2": env.max_accel,
+        "max_decel_mps2": env.max_decel,
+        "max_yaw_rate_rad_s": env.max_yaw_rate,
+        "max_yaw_accel_rad_s2": env.max_yaw_accel,
+        "max_lat_accel_mps2": env.max_lat_accel,
+        "min_turn_radius_m": env.min_turn_radius,
+        "max_pitch_rate_rad_s": env.max_pitch_rate,
+        "max_pitch_rad": env.max_pitch,
+        "goal_radius_m": env.goal_radius,
+        "obstacle_count_range": [env.obstacle_count_min,
+                                 env.obstacle_count_max],
+        "obstacle_radius_range_m": [env.obstacle_radius_min,
+                                    env.obstacle_radius_max],
+        "obstacle_distribution": env.obstacle_distribution,
+        "obstacle_motion": env.obstacle_motion,
+        "obstacle_speed_range_mps": [
+            env.obstacle_speed_min,
+            env.obstacle_speed_max,
+        ],
+        "obstacle_turn_rate_rad_s": env.obstacle_turn_rate_rad_s,
+        "dijkstra_replan_steps": env.dijkstra_replan_steps,
+        "sonar_history_length": env.sonar_history_length,
+        "sonar_history_stride": env.sonar_history_stride,
+        "residual_policy": args.residual_policy,
+        "residual_scale": args.residual_scale,
+        "critic_warmup_steps": args.critic_warmup_steps,
+        "resume_model": (
+            str(args.resume_model) if args.resume_model is not None else None
+        ),
+        "resume_log_std": args.resume_log_std,
+        "sensor_backend": args.sensor_backend,
+        "sensor_device": args.sensor_device,
+        "goal_distance_range_m": list(env.goal_distance_range),
+        "planning_bounds_m": [env.planning_bounds[0].tolist(),
+                              env.planning_bounds[1].tolist()],
+        "dijkstra_resolution_m": env.dijkstra_resolution,
+        "dijkstra_potential_scale": env.dijkstra_potential_scale,
+        "reward_gamma": env.reward_gamma,
+        "gamma": args.gamma,
+        "path_refresh_steps": env.path_refresh_steps,
+        "speed_curriculum": args.speed_curriculum,
+        "target_speed_knots": args.target_speed_knots,
+        "dagger_rounds": args.dagger_rounds,
+        "dagger_steps": args.dagger_steps,
+        "dagger_epochs": args.dagger_epochs,
+        "eval_speeds_knots": args.eval_speeds_knots,
+        "eval_episodes_per_speed": args.eval_episodes,
+        "device": str(device),
+        "torch_threads": args.torch_threads,
+        "csv_dir": "csv",
+    }
 
 
 def _monitored_environment(cruise_speed_range, episode_steps, monitor_path,
@@ -56,6 +164,84 @@ def _initialize_action_bias(model, speed_action):
     with torch.no_grad():
         model.policy.action_net.bias.zero_()
         model.policy.action_net.bias[0] = preactivation
+
+
+class _ConcatObservationView:
+    """Index several observation arrays without copying their contents."""
+
+    def __init__(self, parts):
+        self.parts = tuple(parts)
+        self.lengths = np.asarray([len(part) for part in self.parts])
+        self.ends = np.cumsum(self.lengths)
+        self.dtype = np.result_type(*(part.dtype for part in self.parts))
+        self.shape = (int(self.ends[-1]),) + tuple(self.parts[0].shape[1:])
+
+    def __len__(self):
+        return int(self.ends[-1])
+
+    def __getitem__(self, indices):
+        flat = np.asarray(indices, dtype=np.intp).reshape(-1)
+        output = np.empty((flat.size,) + self.shape[1:], dtype=self.dtype)
+        start = 0
+        for part, end in zip(self.parts, self.ends):
+            selected = (flat >= start) & (flat < end)
+            if selected.any():
+                output[selected] = part[flat[selected] - start]
+            start = int(end)
+        if np.asarray(indices).ndim == 0:
+            return output[0]
+        return output.reshape(np.shape(indices) + self.shape[1:])
+
+
+class _ConcatDataset:
+    """Lightweight union of BC/DAgger datasets."""
+
+    def __init__(self, datasets):
+        flattened = []
+        for dataset in datasets:
+            if isinstance(dataset, _ConcatDataset):
+                flattened.extend(dataset.datasets)
+            else:
+                flattened.append(dataset)
+        self.datasets = tuple(flattened)
+        keys = tuple(self.datasets[0]["observations"])
+        if any(tuple(dataset["observations"]) != keys
+               for dataset in self.datasets[1:]):
+            raise ValueError("datasets have different observation keys")
+        self.observations = {
+            key: _ConcatObservationView([
+                dataset["observations"][key] for dataset in self.datasets
+            ])
+            for key in keys
+        }
+        self.actions = np.concatenate([
+            dataset["actions"] for dataset in self.datasets
+        ])
+        self.steps = int(len(self.actions))
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+
+def _merge_datasets(*datasets):
+    if len(datasets) == 1:
+        return datasets[0]
+    return _ConcatDataset(datasets)
+
+
+def _copy_policy_state(model):
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in model.policy.state_dict().items()
+    }
+
+
+def _selection_key(result):
+    return (
+        float(result["success_rate"]),
+        -float(result["mean_final_distance_m"]),
+        -float(result["collision_rate"]),
+    )
 
 
 def _evaluate(model, eval_env, episodes, seed, speeds_knots):
@@ -114,29 +300,35 @@ def _policy_action_mse(model, dataset, batch_size):
     action_weights = torch.tensor([1.0, 2.0, 4.0], device=policy_device)
     targets = torch.as_tensor(dataset["actions"], device=policy_device)
     losses = []
+    was_training = model.policy.training
     model.policy.set_training_mode(False)
-    with torch.no_grad():
-        for start in range(0, len(targets), batch_size):
-            stop = min(start + batch_size, len(targets))
-            batch = {
-                key: torch.as_tensor(
-                    dataset["observations"][key][start:stop],
-                    dtype=torch.float32,
-                    device=policy_device,
-                )
-                for key in dataset["observations"]
-            }
-            mean = model.policy.get_distribution(batch).distribution.mean
-            prediction = torch.tanh(mean)
-            losses.append(float(torch.mean(
-                action_weights * (prediction - targets[start:stop]) ** 2
-            )))
-    return float(np.mean(losses))
+    try:
+        with torch.no_grad():
+            for start in range(0, len(targets), batch_size):
+                stop = min(start + batch_size, len(targets))
+                batch = {
+                    key: torch.as_tensor(
+                        dataset["observations"][key][start:stop],
+                        dtype=torch.float32,
+                        device=policy_device,
+                    )
+                    for key in dataset["observations"]
+                }
+                mean = model.policy.get_distribution(batch).distribution.mean
+                prediction = torch.tanh(mean)
+                losses.append(float(torch.mean(
+                    action_weights * (prediction - targets[start:stop]) ** 2
+                )))
+        return float(np.mean(losses))
+    finally:
+        model.policy.set_training_mode(was_training)
 
 
 def behavior_clone(model, train_data, val_data, chunk_size, epochs,
                    learning_rate, seed, eval_env, eval_speeds_knots,
                    eval_episodes, eval_interval, patience):
+    if hasattr(model.policy, "set_bc_mode"):
+        model.policy.set_bc_mode(True)
     optimizer = torch.optim.AdamW(
         model.policy.parameters(), lr=learning_rate, weight_decay=1e-4
     )
@@ -155,6 +347,7 @@ def behavior_clone(model, train_data, val_data, chunk_size, epochs,
     last_success = 0.0
     model.policy.set_training_mode(True)
     for epoch in range(epochs):
+        model.policy.set_training_mode(True)
         permutation = random.permutation(steps)
         train_losses = []
         for start in range(0, steps, chunk_size):
@@ -298,9 +491,31 @@ class BestEvalCallback(BaseCallback):
         return True
 
 
+class ResidualWarmupCallback(BaseCallback):
+    """Train only Critic parameters before enabling residual actions."""
+
+    def __init__(self, warmup_steps):
+        super().__init__()
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.enabled = False
+
+    def _on_step(self):
+        if self.enabled:
+            return True
+        if self.num_timesteps >= self.warmup_steps:
+            if hasattr(self.model.policy, "enable_residual_updates"):
+                self.model.policy.enable_residual_updates()
+            self.enabled = True
+            print(
+                f"Critic warmup complete at {self.num_timesteps} steps",
+                flush=True,
+            )
+        return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--timesteps", type=int, default=500_000)
+    parser.add_argument("--timesteps", type=int, default=300_000)
     parser.add_argument("--episode-steps", type=int, default=800)
     parser.add_argument(
         "--n-steps", type=int, default=None,
@@ -310,52 +525,83 @@ def main():
         "--batch-size", type=int, default=None,
         help="PPO minibatch size; default is 1024 when the rollout permits it",
     )
-    parser.add_argument("--num-envs", type=int,
-                        default=min(64, max(1, (os.cpu_count() or 2) // 2)))
-    parser.add_argument("--min-obstacles", type=int, default=None)
-    parser.add_argument("--max-obstacles", type=int, default=None)
+    parser.add_argument("--num-envs", type=int, default=8)
+    parser.add_argument("--min-obstacles", type=int, default=300)
+    parser.add_argument("--max-obstacles", type=int, default=450)
     parser.add_argument("--obstacle-radius-min", type=float, default=None)
     parser.add_argument("--obstacle-radius-max", type=float, default=None)
     parser.add_argument("--obstacle-distribution", choices=("uniform",),
                         default="uniform")
+    parser.add_argument("--obstacle-motion", choices=("static", "random"),
+                        default="random")
+    parser.add_argument("--obstacle-speed-min-knots", type=float, default=1.0)
+    parser.add_argument("--obstacle-speed-max-knots", type=float, default=10.0)
+    parser.add_argument("--obstacle-turn-rate-rad-s", type=float, default=0.15)
+    parser.add_argument("--dijkstra-replan-steps", type=int, default=10)
+    parser.add_argument("--sonar-history-length", type=int, default=8)
+    parser.add_argument("--sonar-history-stride", type=int, default=4)
+    parser.add_argument(
+        "--residual-policy", action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--residual-scale", type=float, default=0.30)
+    parser.add_argument("--critic-warmup-steps", type=int, default=30_000)
+    parser.add_argument(
+        "--resume-model", type=Path,
+        help="initialize PPO from an existing policy and skip BC/DAgger",
+    )
+    parser.add_argument(
+        "--resume-log-std", type=float,
+        help="optional log standard deviation to reset after loading",
+    )
+    parser.add_argument("--target-speed-knots", type=float, default=50.0)
+    parser.add_argument("--dijkstra-potential-scale", type=float, default=100.0)
+    parser.add_argument("--distance-potential-scale", type=float,
+                        default=250.0)
     parser.add_argument("--sensor-backend", choices=("cpu", "gpu"),
-                        default="cpu")
+                        default="gpu")
     parser.add_argument("--sensor-device", default="cuda",
                         help="device for GPU sensor backend: cuda, cuda:0, cpu")
     parser.add_argument("--device", default="cuda",
                         help="PyTorch device: cuda, cuda:0, cpu, or auto")
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--n-epochs", type=int, default=10)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--bc-finetune-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--ent-coef", type=float, default=0.001)
-    parser.add_argument("--log-std-init", type=float, default=-1.0)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--bc-finetune-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--ent-coef", type=float, default=0.0)
+    parser.add_argument("--log-std-init", type=float, default=-2.5)
     parser.add_argument("--gamma", type=float, default=0.999)
     parser.add_argument("--gae-lambda", type=float, default=0.995)
-    parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument("--target-kl", type=float, default=0.05)
     parser.add_argument("--initial-speed-action", type=float, default=0.2)
     parser.add_argument("--bc-steps", type=int, default=100_000)
     parser.add_argument("--bc-val-steps", type=int, default=15_000)
-    parser.add_argument(
-        "--bc-workers", type=int,
-        default=min(32, max(1, (os.cpu_count() or 2) // 4)),
-    )
+    parser.add_argument("--bc-workers", type=int, default=8)
     parser.add_argument("--bc-chunk-size", type=int, default=2_048)
     parser.add_argument("--bc-epochs", type=int, default=20)
     parser.add_argument("--bc-learning-rate", type=float, default=3e-4)
     parser.add_argument("--bc-eval-interval", type=int, default=5)
     parser.add_argument("--bc-eval-episodes", type=int, default=20)
     parser.add_argument("--bc-patience", type=int, default=2)
-    parser.add_argument("--bc-min-success-rate", type=float, default=0.70)
+    parser.add_argument("--bc-min-success-rate", type=float, default=0.60)
+    parser.add_argument("--dagger-rounds", type=int, default=8)
+    parser.add_argument("--dagger-steps", type=int, default=30_000)
+    parser.add_argument("--dagger-workers", type=int, default=4)
+    parser.add_argument("--dagger-epochs", type=int, default=5)
+    parser.add_argument("--dagger-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--dagger-eval-interval", type=int, default=5)
+    parser.add_argument("--dagger-patience", type=int, default=2)
+    parser.add_argument("--dagger-deterministic",
+                        action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bc-only", action="store_true",
                         help="collect/train/evaluate BC, then exit without PPO")
     parser.add_argument("--allow-low-bc", action="store_true")
-    parser.add_argument("--eval-freq", type=int, default=25_000)
-    parser.add_argument("--eval-episodes", type=int, default=5)
+    parser.add_argument("--eval-freq", type=int, default=10_000)
+    parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--eval-speeds-knots", type=float, nargs="+",
-                        default=[10.0, 20.0, 30.0, 40.0, 50.0])
+                        default=[50.0])
     parser.add_argument("--speed-curriculum", action=argparse.BooleanOptionalAction,
-                        default=True)
+                        default=False)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path,
                         default=Path("output_model/kinematic_ppo"))
@@ -386,6 +632,41 @@ def main():
         parser.error("invalid obstacle count range")
     if radius_min <= 0.0 or radius_max < radius_min:
         parser.error("invalid obstacle radius range")
+    if args.obstacle_speed_min_knots < 0.0 or (
+            args.obstacle_speed_max_knots < args.obstacle_speed_min_knots):
+        parser.error("invalid obstacle speed range")
+    if args.obstacle_speed_max_knots * KNOT_MPS > 50.0 * KNOT_MPS:
+        parser.error("obstacle-speed-max-knots must not exceed 50 knots")
+    if args.obstacle_turn_rate_rad_s < 0.0:
+        parser.error("obstacle-turn-rate-rad-s must be nonnegative")
+    if args.dijkstra_replan_steps < 0:
+        parser.error("dijkstra-replan-steps must be nonnegative")
+    if args.sonar_history_length < 0:
+        parser.error("sonar-history-length must be nonnegative")
+    if args.sonar_history_stride <= 0:
+        parser.error("sonar-history-stride must be positive")
+    if not 0.0 < args.residual_scale <= 1.0:
+        parser.error("residual-scale must be in (0, 1]")
+    if args.critic_warmup_steps < 0:
+        parser.error("critic-warmup-steps must be nonnegative")
+    if args.resume_model is not None and not args.resume_model.is_file():
+        parser.error(f"resume model does not exist: {args.resume_model}")
+    if args.resume_model is not None and args.sonar_history_length > 0:
+        parser.error(
+            "LSTM sonar history changes the observation space; "
+            "resume is incompatible. Retrain BC with "
+            "--sonar-history-length 8 or set it to 0."
+        )
+    if args.resume_model is not None and args.residual_policy:
+        parser.error(
+            "resume model predates the residual action head; "
+            "retrain BC or use --no-residual-policy."
+        )
+    if args.resume_model is not None and args.bc_only:
+        parser.error("--bc-only cannot be combined with --resume-model")
+    if args.resume_model is not None:
+        args.bc_steps = 0
+        args.dagger_rounds = 0
     if args.bc_steps > 0 and min(
         args.bc_val_steps, args.bc_workers, args.bc_eval_interval,
         args.bc_eval_episodes, args.bc_patience,
@@ -393,6 +674,19 @@ def main():
         parser.error("BC validation and collection parameters must be positive")
     if not 0.0 <= args.bc_min_success_rate <= 1.0:
         parser.error("bc-min-success-rate must be between 0 and 1")
+    if not 0.0 < args.target_speed_knots <= 50.0:
+        parser.error("target-speed-knots must be in (0, 50]")
+    if args.dijkstra_potential_scale <= 0.0:
+        parser.error("dijkstra-potential-scale must be positive")
+    if args.distance_potential_scale <= 0.0:
+        parser.error("distance-potential-scale must be positive")
+    if args.dagger_rounds < 0:
+        parser.error("dagger-rounds must be nonnegative")
+    if args.dagger_rounds > 0 and min(
+        args.dagger_steps, args.dagger_workers, args.dagger_epochs,
+        args.dagger_eval_interval, args.dagger_patience,
+    ) <= 0:
+        parser.error("DAgger parameters must be positive")
 
     args.output.mkdir(parents=True, exist_ok=True)
     model_path = args.output / "ppo_kinematic.zip"
@@ -402,8 +696,12 @@ def main():
     if model_path.exists() and not args.overwrite:
         parser.error(f"model exists: {model_path}; use --overwrite")
     for stale in (model_path, final_model_path, best_model_path, best_info_path,
-                  args.output / "vecnormalize.pkl"):
+                  args.output / "vecnormalize.pkl",
+                  args.output / "bc_gate_failure.json"):
         if stale.exists():
+            stale.unlink()
+    for stale in args.output.glob("dagger_round_*"):
+        if stale.is_file():
             stale.unlink()
 
     torch.set_num_threads(max(1, args.torch_threads))
@@ -412,15 +710,50 @@ def main():
     monitor_dir = csv_dir / "monitors"
     monitor_dir.mkdir(parents=True, exist_ok=True)
     logger = configure(str(csv_dir), ["stdout", "csv"])
-    full_speed_range = knots((5.0, 50.0))
+    full_speed_range = knots((args.target_speed_knots, args.target_speed_knots))
     env_kwargs = {
         "obstacle_count_range": (min_obstacles, max_obstacles),
         "obstacle_radius_range": (radius_min, radius_max),
         "obstacle_distribution": args.obstacle_distribution,
+        "obstacle_motion": args.obstacle_motion,
+        "obstacle_speed_range": (
+            args.obstacle_speed_min_knots * KNOT_MPS,
+            args.obstacle_speed_max_knots * KNOT_MPS,
+        ),
+        "obstacle_turn_rate_rad_s": args.obstacle_turn_rate_rad_s,
+        "dijkstra_replan_steps": 0,
+        "sonar_history_length": args.sonar_history_length,
+        "sonar_history_stride": args.sonar_history_stride,
         "sensor_backend": args.sensor_backend,
         "sensor_device": args.sensor_device,
+        "dijkstra_potential_scale": args.dijkstra_potential_scale,
+        "use_dijkstra": False,
+        "include_path_observation": False,
+        "reward_mode": "euclidean",
+        "distance_potential_scale": args.distance_potential_scale,
+        "reward_gamma": args.gamma,
     }
-    initial_speed_range = knots((5.0, 20.0)) if args.speed_curriculum else full_speed_range
+    bc_env_kwargs = {
+        **env_kwargs,
+        "obstacle_motion": "static",
+        "dijkstra_replan_steps": 0,
+        "use_dijkstra": True,
+        "reward_mode": "euclidean",
+    }
+    probe = _environment(
+        full_speed_range, max_steps=args.episode_steps,
+        **{**env_kwargs, "sensor_backend": "cpu", "sensor_device": "cpu"},
+    )
+    try:
+        run = _run_metadata(args, probe, full_speed_range, device)
+    finally:
+        probe.close()
+    run_path = args.output / "run.json"
+    run_path.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+    initial_speed_range = (
+        knots((5.0, min(20.0, args.target_speed_knots)))
+        if args.speed_curriculum else full_speed_range
+    )
     train_env_fns = [
         lambda index=index: _monitored_environment(
             initial_speed_range,
@@ -443,7 +776,12 @@ def main():
     eval_raw = DummyVecEnv([lambda: _environment(
         full_speed_range, max_steps=args.episode_steps, **env_kwargs
     )])
+    bc_eval_raw = DummyVecEnv([lambda: _environment(
+        full_speed_range, max_steps=args.episode_steps, **bc_env_kwargs
+    )])
     base_env = env.get_attr("unwrapped")[0]
+    run = _run_metadata(args, base_env, full_speed_range, device)
+    run_path.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
     configure_torch(device)
     try:
         model = PPO(
@@ -459,24 +797,71 @@ def main():
                 "features_extractor_class": SonarCNNFeaturesExtractor,
                 "features_extractor_kwargs": {"features_dim": 256},
                 "log_std_init": args.log_std_init,
+                "residual_scale": (
+                    args.residual_scale if args.residual_policy else None
+                ),
             },
         )
+        if args.resume_model is not None:
+            model = PPO.load(
+                str(args.resume_model),
+                env=env,
+                device=str(device),
+            )
         model.set_logger(logger)
-        _initialize_action_bias(model, args.initial_speed_action)
+        if args.resume_model is None:
+            _initialize_action_bias(model, args.initial_speed_action)
 
         bc_steps_actual = 0
         bc_loss = None
         bc_eval = None
         bc_info = None
         bc_data_stats = None
-        if args.bc_steps > 0:
+        ppo_initial_eval = None
+        train_data = None
+        val_data = None
+        dagger_train_data = None
+        combined_data = None
+        dagger_data = None
+
+        if args.resume_model is not None:
+            model.learning_rate = args.bc_finetune_learning_rate
+            model._setup_lr_schedule()
+            for group in model.policy.optimizer.param_groups:
+                group["lr"] = args.bc_finetune_learning_rate
+            if args.resume_log_std is not None:
+                with torch.no_grad():
+                    model.policy.log_std.data.fill_(args.resume_log_std)
+            bc_eval = _evaluate(
+                model, eval_raw, args.bc_eval_episodes, args.seed,
+                args.eval_speeds_knots,
+            )
+            bc_eval["timestep"] = 0
+            model.save(str(
+                (args.output / "resume_initial_model").with_suffix("")
+            ))
+            model.save(str(best_model_path.with_suffix("")))
+            best_info_path.write_text(
+                json.dumps(bc_eval, indent=2) + "\n", encoding="utf-8"
+            )
+            bc_info = {
+                "mode": "resumed_policy",
+                "source": str(args.resume_model),
+            }
+            ppo_initial_eval = bc_eval
+            print(
+                f"Resumed model evaluation: "
+                f"success={bc_eval['success_rate']:.0%}",
+                flush=True,
+            )
+        elif args.bc_steps > 0:
             train_data = collect_teacher_dataset(
                 args.bc_steps,
                 seed_start=10_000 + args.seed * 1_000_000,
                 speeds_knots=args.eval_speeds_knots,
                 episode_steps=args.episode_steps,
                 workers=args.bc_workers,
-                env_kwargs=env_kwargs,
+                env_kwargs=bc_env_kwargs,
             )
             val_data = collect_teacher_dataset(
                 args.bc_val_steps,
@@ -484,7 +869,7 @@ def main():
                 speeds_knots=args.eval_speeds_knots,
                 episode_steps=args.episode_steps,
                 workers=args.bc_workers,
-                env_kwargs=env_kwargs,
+                env_kwargs=bc_env_kwargs,
             )
             bc_data_stats = {
                 "train": {key: value for key, value in train_data.items()
@@ -498,25 +883,132 @@ def main():
             bc_info = behavior_clone(
                 model, train_data, val_data, args.bc_chunk_size,
                 args.bc_epochs, args.bc_learning_rate, args.seed,
-                eval_raw, args.eval_speeds_knots, args.bc_eval_episodes,
+                bc_eval_raw, args.eval_speeds_knots, args.bc_eval_episodes,
                 args.bc_eval_interval, args.bc_patience,
             )
             bc_steps_actual = bc_info["steps"]
             bc_loss = bc_info["validation_action_mse"]
-            model.save(str((args.output / "bc_model").with_suffix("")))
-            bc_eval = _evaluate(
-                model, eval_raw, args.bc_eval_episodes, args.seed,
+            model.save(str((args.output / "bc_initial_model").with_suffix("")))
+            initial_eval = _evaluate(
+                model, bc_eval_raw, args.bc_eval_episodes, args.seed,
                 args.eval_speeds_knots,
             )
-            bc_eval["timestep"] = 0
-            print(f"BC evaluation: success={bc_eval['success_rate']:.0%}", flush=True)
+            initial_eval["timestep"] = 0
+            best_bc_key = _selection_key(initial_eval)
+            best_bc_state = _copy_policy_state(model)
+            best_bc_eval = initial_eval
+            best_bc_info = dict(bc_info)
+            best_bc_epoch = "initial"
+            print(
+                f"Initial BC evaluation: "
+                f"success={initial_eval['success_rate']:.0%}",
+                flush=True,
+            )
+
+            dagger_stats = []
+            dagger_train_data = None
+            if args.dagger_rounds > 0:
+                for dagger_round in range(1, args.dagger_rounds + 1):
+                    student_path = (
+                        (args.output / f"dagger_round_{dagger_round}_student.zip")
+                        .resolve()
+                    )
+                    model.save(str(student_path.with_suffix("")))
+                    dagger_data = collect_dagger_dataset(
+                        student_path,
+                        args.dagger_steps,
+                        seed_start=(
+                            300_000_000
+                            + args.seed * 1_000_000
+                            + dagger_round * 10_000_000
+                        ),
+                        speeds_knots=args.eval_speeds_knots,
+                        episode_steps=args.episode_steps,
+                        workers=args.dagger_workers,
+                        env_kwargs=bc_env_kwargs,
+                        deterministic=args.dagger_deterministic,
+                    )
+                    dagger_train_data = (
+                        dagger_data if dagger_train_data is None
+                        else _merge_datasets(dagger_train_data, dagger_data)
+                    )
+                    combined_data = _merge_datasets(
+                        train_data, dagger_train_data
+                    )
+                    round_info = behavior_clone(
+                        model, combined_data, val_data, args.bc_chunk_size,
+                        args.dagger_epochs, args.dagger_learning_rate,
+                        args.seed + dagger_round, bc_eval_raw,
+                        args.eval_speeds_knots, args.bc_eval_episodes,
+                        args.dagger_eval_interval, args.dagger_patience,
+                    )
+                    round_eval = _evaluate(
+                        model, bc_eval_raw, args.bc_eval_episodes,
+                        args.seed, args.eval_speeds_knots,
+                    )
+                    round_eval["timestep"] = 0
+                    round_info["evaluation"] = {
+                        key: value for key, value in round_eval.items()
+                        if key != "rows"
+                    }
+                    dagger_stats.append({
+                        "round": dagger_round,
+                        "collected": {
+                            key: value for key, value in dagger_data.items()
+                            if key not in {"observations", "actions"}
+                        },
+                        "training": round_info,
+                    })
+                    model.save(str(
+                        (args.output / f"dagger_round_{dagger_round}_model")
+                        .with_suffix("")
+                    ))
+                    print(
+                        f"DAgger round {dagger_round}: "
+                        f"success={round_eval['success_rate']:.0%}",
+                        flush=True,
+                    )
+                    round_key = _selection_key(round_eval)
+                    if round_key > best_bc_key:
+                        best_bc_key = round_key
+                        best_bc_state = _copy_policy_state(model)
+                        best_bc_eval = round_eval
+                        best_bc_info = round_info
+                        best_bc_epoch = f"dagger_{dagger_round}"
+                    bc_data_stats["dagger"] = dagger_stats
+                    (args.output / "bc_data_stats.json").write_text(
+                        json.dumps(bc_data_stats, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+
+            model.policy.load_state_dict(best_bc_state)
+            model.save(str((args.output / "bc_model").with_suffix("")))
+            bc_eval = best_bc_eval
+            bc_info = best_bc_info
+            bc_loss = best_bc_info.get(
+                "validation_action_mse", bc_loss
+            )
+            print(
+                f"Final BC evaluation: success={bc_eval['success_rate']:.0%} "
+                f"(selected={best_bc_epoch})",
+                flush=True,
+            )
             if args.bc_only:
                 shutil.copyfile(args.output / "bc_model.zip", model_path)
                 bc_run = {
                     "algorithm": "BC",
                     "policy_mode": "bc_only",
                     "policy_action_distribution": ACTION_DISTRIBUTION,
-                    "observation_type": OBSERVATION_TYPE,
+                    "observation_type": _observation_type(
+                        args.sonar_history_length, False
+                    ),
+                    "bc_obstacle_motion": "static",
+                    "ppo_obstacle_motion": None,
+                    "ppo_uses_dijkstra": False,
+                    "include_path_observation": False,
+                    "ppo_reward_mode": "euclidean",
+                    "sonar_history_length": args.sonar_history_length,
+                    "sonar_history_stride": args.sonar_history_stride,
                     "timesteps_after_run": 0,
                     "selected_checkpoint": "bc_model.zip",
                     "bc_steps": bc_steps_actual,
@@ -551,7 +1043,15 @@ def main():
                     "planning_bounds_m": [base_env.planning_bounds[0].tolist(),
                                           base_env.planning_bounds[1].tolist()],
                     "dijkstra_resolution_m": base_env.dijkstra_resolution,
+                    "dijkstra_potential_scale":
+                        base_env.dijkstra_potential_scale,
+                    "distance_potential_scale":
+                        args.distance_potential_scale,
+                    "reward_gamma": base_env.reward_gamma,
+                    "gamma": args.gamma,
                     "path_refresh_steps": base_env.path_refresh_steps,
+                    "target_speed_knots": args.target_speed_knots,
+                    "dagger_rounds": args.dagger_rounds,
                     "eval_speeds_knots": args.eval_speeds_knots,
                     "device": str(device),
                     "csv_dir": "csv",
@@ -584,19 +1084,46 @@ def main():
                     flush=True,
                 )
                 return
-            if bc_eval["success_rate"] > 0.0:
-                model.save(str(best_model_path.with_suffix("")))
-                best_info_path.write_text(
-                    json.dumps(bc_eval, indent=2) + "\n", encoding="utf-8"
-                )
+            ppo_initial_eval = _evaluate(
+                model, eval_raw, args.eval_episodes, args.seed,
+                args.eval_speeds_knots,
+            )
+            ppo_initial_eval["timestep"] = 0
+            model.save(str(best_model_path.with_suffix("")))
+            best_info_path.write_text(
+                json.dumps(ppo_initial_eval, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"Dynamic PPO baseline: "
+                f"success={ppo_initial_eval['success_rate']:.0%}",
+                flush=True,
+            )
+            train_data = None
+            val_data = None
+            dagger_train_data = None
+            combined_data = None
+            dagger_data = None
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             model.learning_rate = args.bc_finetune_learning_rate
             model._setup_lr_schedule()
             for group in model.policy.optimizer.param_groups:
                 group["lr"] = args.bc_finetune_learning_rate
 
+        if args.residual_policy:
+            model.policy.prepare_residual_ppo()
+            if args.critic_warmup_steps == 0:
+                model.policy.enable_residual_updates()
+
         callbacks = []
         if args.speed_curriculum:
             callbacks.append(SpeedCurriculumCallback(args.timesteps))
+        if args.residual_policy and args.critic_warmup_steps > 0:
+            callbacks.append(ResidualWarmupCallback(
+                args.critic_warmup_steps
+            ))
         callbacks.append(BestEvalCallback(
             eval_raw, args.eval_freq, args.eval_episodes,
             args.eval_speeds_knots, best_model_path, best_info_path, args.seed,
@@ -619,66 +1146,35 @@ def main():
         best = None
         if best_info_path.is_file():
             best = json.loads(best_info_path.read_text(encoding="utf-8"))
-        run = {
-            "algorithm": "PPO",
-            "policy_mode": "bc_initialized_pure_ppo" if bc_steps_actual else "pure_ppo",
-            "policy_action_distribution": ACTION_DISTRIBUTION,
-            "observation_type": OBSERVATION_TYPE,
-            "timesteps": args.timesteps,
+        run.update({
+            "training_status": "completed",
             "timesteps_after_run": model.num_timesteps,
-            "num_envs": args.num_envs,
-            "n_steps": args.n_steps,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "bc_finetune_learning_rate": args.bc_finetune_learning_rate,
             "selected_checkpoint": selected,
             "best_eval": best,
             "bc_steps": bc_steps_actual,
             "bc_final_action_mse": bc_loss,
             "bc_eval": bc_eval,
+            "ppo_initial_eval": ppo_initial_eval,
             "bc_info": bc_info,
             "bc_data_stats": bc_data_stats,
-            "episode_steps": args.episode_steps,
-            "dt": base_env.dt,
-            "speed_min_mps": base_env.speed_min,
-            "speed_max_mps": base_env.speed_max,
-            "cruise_speed_range_mps": list(full_speed_range),
-            "max_accel_mps2": base_env.max_accel,
-            "max_decel_mps2": base_env.max_decel,
-            "max_yaw_rate_rad_s": base_env.max_yaw_rate,
-            "max_yaw_accel_rad_s2": base_env.max_yaw_accel,
-            "max_lat_accel_mps2": base_env.max_lat_accel,
-            "min_turn_radius_m": base_env.min_turn_radius,
-            "max_pitch_rate_rad_s": base_env.max_pitch_rate,
-            "max_pitch_rad": base_env.max_pitch,
-            "goal_radius_m": base_env.goal_radius,
-            "obstacle_count_range": [base_env.obstacle_count_min,
-                                     base_env.obstacle_count_max],
-            "obstacle_radius_range_m": [
-                base_env.obstacle_radius_min,
-                base_env.obstacle_radius_max,
-            ],
-            "obstacle_distribution": base_env.obstacle_distribution,
-            "sensor_backend": base_env.sensor_backend,
-            "sensor_device": base_env.sensor_device,
-            "goal_distance_range_m": list(base_env.goal_distance_range),
-            "planning_bounds_m": [base_env.planning_bounds[0].tolist(),
-                                  base_env.planning_bounds[1].tolist()],
-            "dijkstra_resolution_m": base_env.dijkstra_resolution,
-            "path_refresh_steps": base_env.path_refresh_steps,
-            "speed_curriculum": args.speed_curriculum,
-            "eval_speeds_knots": args.eval_speeds_knots,
-            "eval_episodes_per_speed": args.eval_episodes,
-            "device": str(device),
-            "torch_threads": args.torch_threads,
-            "csv_dir": "csv",
-        }
-        (args.output / "run.json").write_text(
-            json.dumps(run, indent=2) + "\n", encoding="utf-8"
-        )
+        })
+        run_path.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
         print(f"Saved {model_path} ({selected})")
+    except KeyboardInterrupt:
+        run["training_status"] = "interrupted"
+        if "model" in locals():
+            run["timesteps_after_run"] = model.num_timesteps
+            run["interrupted_checkpoint"] = "ppo_kinematic_interrupted.zip"
+        run_path.write_text(json.dumps(run, indent=2) + "\n",
+                            encoding="utf-8")
+        if "model" in locals():
+            model.save(str(args.output / "ppo_kinematic_interrupted"))
+            env.save(str(args.output / "vecnormalize_interrupted.pkl"))
+        print(f"Interrupted; saved config and checkpoint in {args.output}",
+              flush=True)
     finally:
         eval_raw.close()
+        bc_eval_raw.close()
         env.close()
 
 

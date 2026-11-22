@@ -43,7 +43,7 @@
 
 本项目的论文定位是：
 
-> 研究复杂静态障碍环境中的多速度三维路径规划与跟踪，不讨论推进器、空化、
+> 研究复杂静态障碍环境中的高速三维路径规划与跟踪，不讨论推进器、空化、
 > 螺旋桨效率和高速水动力参数标定。
 
 训练和主评估均使用运动学模型。HoloOcean 仅用于独立场景回放、碰撞几何检查和
@@ -86,7 +86,10 @@ cd /path/to/HighSpeedUUV_Kinematic
 - 最大俯仰角和俯仰角速度
 - 偏航/俯仰角加速度限制
 
-场景默认在整个三维规划空间中均匀随机生成 20–32 个障碍物。
+场景默认在整个三维规划空间中均匀随机生成 20–32 个障碍物；GPU
+高密度实验通常使用 `--min-obstacles 100 --max-obstacles 150`。
+起终点的实际三维直线距离默认随机采样为 650–900 m，规划空间为
+X ∈ [-100, 1100] m、Y ∈ [-750, 750] m、Z ∈ [0, 100] m。
 障碍半径采用 4–22 m 的混合分布，其中包含更多 14–22 m 的大半径障碍物。
 
 这样高速时自动限制转弯角速度，避免“高速大角度急转弯”。
@@ -96,41 +99,136 @@ cd /path/to/HighSpeedUUV_Kinematic
 ```text
 sonar  : (6, 12, 48) 三路几何声呐
 target : 目标俯仰、偏航、速度误差、归一化距离
-path   : Dijkstra 路径俯仰、偏航、前视距离、剩余代价
 motion : 当前速度、巡航速度、速度上下限、偏航率、俯仰、俯仰率
 ```
+
+当前学生策略观测不包含 Dijkstra 路径。Dijkstra 只作为教师内部信息，用于静态
+BC/DAgger 数据生成；PPO 完全根据声呐历史、目标方向/距离和自身运动状态决策。
 
 ## 训练
 
 默认流程：
 
-1. 从不同场景采集 100,000 步成功教师轨迹，训练集和验证集使用互斥种子；
-2. 行为克隆最多 20 个 epoch，按验证集和闭环成功率早停；
-3. BC 默认在 10/20/30/40/50 节各评估 20 回合；
-4. BC 成功率低于 85% 时默认停止，不启动 PPO；
-5. 使用 `1e-4` 学习率 PPO 微调，并保留 BC 初始化作为兜底；
-6. 每 25k 步在每档速度各评估 5 回合，保留成功率最高的 checkpoint。
+1. 默认目标速度固定为 50 节，不再随机训练 10–40 节；
+2. BC、DAgger 和 BC 评估只使用静态障碍；
+3. 教师使用 Dijkstra 路径生成专家动作，但学生观测中不包含路径；
+4. BC 和 DAgger 完成后，在静态场景上执行成功率门槛判断；
+5. PPO 切换到动态障碍，不再构建、重规划或奖励 Dijkstra 代价场；
+6. PPO 使用低权重欧氏距离势函数，并保留速度、安全与终端奖励；
+7. 默认只在 50 节上评估，并保留最佳 checkpoint。
 
 ```bash
 cd /path/to/HighSpeedUUV_Kinematic
 ./scripts/train.sh \
-  --timesteps 500000 \
-  --output output_model/kinematic_ppo \
+  --output output_model/static_bc_dynamic_ppo \
   --overwrite
 ```
 
-训练默认使用 `cuda`、64 路并行采样和 A100 的 TF32 加速。可通过
+当前默认配置为 30 万步 PPO、8 路并行采样、每路 512 步 rollout、1024 的
+PPO batch、300–450 个障碍、50 节目标速度，以及 LSTM + 残差 PPO。BC 阶段使用
+静态障碍，PPO 阶段使用 1–10 节动态障碍。
+`n_steps` 和 `batch_size` 会根据并行环境数自动选择；使用默认 8 路环境时分别
+解析为 512 和 1024。
+
+训练默认使用 `cuda`、8 路并行采样和 A100 的 TF32 加速。可通过
 `--device cuda:0`、`--num-envs 8` 和 `--torch-threads 1` 调整。模型、行为克隆、
 策略评估和 PPO 更新均在 GPU 上执行；运动学仿真环境仍由 CPU 并行运行。
 
 BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛可通过
 `--bc-min-success-rate` 修改；仅调试流程时可使用 `--allow-low-bc` 跳过门槛。
 
+DAgger 默认执行 2 轮，每轮采集 30,000 步 BC 实际访问状态，并用教师动作
+进行纠正。可通过以下参数调整：
+
+```text
+--dagger-rounds 2
+--dagger-steps 30000
+--dagger-workers 4
+--dagger-epochs 5
+--dagger-learning-rate 1e-4
+--dagger-deterministic
+```
+
+设置 `--dagger-rounds 0` 可以关闭 DAgger。
+
+## 从现有模型继续动态障碍 PPO
+
+使用 `--resume-model` 可以加载同版无路径观测的 checkpoint，自动跳过 BC 和
+DAgger 数据采集。旧版包含 `path` 观测的模型不能直接加载：
+
+```bash
+./scripts/train.sh \
+  --resume-model output_model/static_bc_dynamic_ppo/bc_model.zip \
+  --obstacle-motion random \
+  --obstacle-speed-min-knots 1 \
+  --obstacle-speed-max-knots 10 \
+  --timesteps 300000 \
+  --num-envs 8 \
+  --sensor-backend gpu \
+  --sensor-device cuda \
+  --device cuda \
+  --learning-rate 3e-5 \
+  --bc-finetune-learning-rate 3e-5 \
+  --resume-log-std -2.0 \
+  --target-kl 0.02 \
+  --output output_model/ppo_v7_dynamic \
+  --overwrite
+```
+
+`--resume-model` 会自动把 `bc-steps` 和 `dagger-rounds` 置为 0。
+
+PPO 不再使用 Dijkstra 奖励。欧氏距离采用标准势函数：
+
+```text
+Phi_d(s) = -distance_to_goal(s) / distance_potential_scale
+r_distance = gamma * Phi_d(s_next) - Phi_d(s)
+```
+
+默认 `distance_potential_scale=250`。这种写法比直接奖励
+`old_distance - new_distance` 更稳定，避免策略通过重复绕行累积距离奖励。
+最终 PPO 奖励主要由低权重距离势函数、速度误差、安全净距和到达/碰撞终端项组成。
+
+Dijkstra 只保留在静态教师采集中。由于 PPO 不再访问代价场，
+`--dijkstra-replan-steps` 不会影响 PPO 阶段的速度或奖励。
+
+## LSTM 与残差 PPO
+
+声呐默认保留 8 个采样帧，每 4 个控制步取一帧，形成约 2.8 秒的历史窗口：
+
+```text
+--sonar-history-length 8
+--sonar-history-stride 4
+```
+
+这比连续 3 帧覆盖的范围更长，同时在 BC 数据中以 `float16` 保存
+`sonar_history`，避免历史窗口增大后观测数据集占用内存翻倍。
+
+残差 PPO 默认开启：
+
+```text
+--residual-policy
+--residual-scale 0.30
+--critic-warmup-steps 30000
+```
+
+BC 训练主策略和特征提取器；进入 PPO 后冻结 BC 主策略，只训练小幅残差动作头。
+Critic warmup 期间残差动作头关闭，只训练价值网络，结束后开放残差动作和探索方差。
+
+BC 成功率门槛使用静态场景，只决定是否进入 PPO。进入 PPO 前还会在动态开发种子
+上重新评估 BC，作为 PPO checkpoint 的公平初始基线；后续最佳模型按动态成功率、
+最终距离和碰撞率选择，不会再拿静态 BC 成绩和动态 PPO 成绩直接比较。
+
+注意：无路径观测、LSTM 和残差动作头都会改变模型结构，旧版包含 Dijkstra 路径
+观测的 checkpoint 不能直接用于该配置，需要重新运行 BC。
+
 训练输出：
 
 - `ppo_kinematic.zip`：周期评估选出的最佳模型
 - `ppo_kinematic_final.zip`：PPO 最终模型
 - `bc_model.zip`：BC 初始化模型
+- `bc_initial_model.zip`：DAgger 前的初始 BC 模型
+- `dagger_round_*_student.zip`：每轮 DAgger 采样时的学生模型
+- `dagger_round_*_model.zip`：每轮 DAgger 再训练后的模型
 - `best_eval.json`：最佳模型评估
 - `run.json`：完整运动学和训练配置
 - `csv/progress.csv`：训练曲线
@@ -138,16 +236,34 @@ BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛
 
 ## 评估
 
-默认分别在 10、20、30、40、50 节各运行 20 回合：
+默认在 50 节运行 20 回合：
 
 ```bash
 ./scripts/evaluate.sh output_model/kinematic_ppo/ppo_kinematic.zip \
-  --episodes-per-speed 20 --seed 0 \
+  --episodes-per-speed 20 --seed 0 --speeds-knots 50 \
   --output output_model/kinematic_eval
 ```
 
 策略评估默认使用 `--device cuda`；如需显式指定 GPU，可传入
 `--device cuda:0`。
+
+评估默认启用随机运动的障碍物，训练环境仍然保持静态。障碍默认速度为
+1–10 节，可通过以下参数控制：
+
+```text
+--moving-obstacles
+--obstacle-speed-min-knots 1
+--obstacle-speed-max-knots 10
+--obstacle-turn-rate-rad-s 0.15
+```
+
+障碍物速度上限不得超过 UUV 最大速度。需要静态对照时使用：
+
+```bash
+./scripts/evaluate.sh output_model/kinematic_ppo/ppo_kinematic.zip \
+  --episodes-per-speed 20 --speeds-knots 50 \
+  --no-moving-obstacles
+```
 
 输出：
 
@@ -156,6 +272,9 @@ BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛
 - `evaluation_summary.json`
 - `evaluation.png`
 - `trajectories/*.npz`：可用于 HoloOcean 回放的轨迹
+
+动态障碍评估的轨迹会额外保存 `obstacle_positions`、`obstacles_initial`、
+`obstacles_final` 和 `max_obstacle_speed_mps`。
 
 评估同时记录：
 

@@ -1,12 +1,32 @@
+# Python
 __pycache__/
 *.py[cod]
-.venv/
-.cache/
 *.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments and local configuration
+.venv/
+venv/
+.env
+.cache/
+
+# Generated training and evaluation artifacts
 runs/
-# *.zip
-*.pkl
+output_model/
+tmp/
+*.log
 *.csv
-*.png
-*.json
+*.pkl
 *.npz
+*.zip
+*.pt
+*.pth
+*.onnx
+*.mp4
+
+# Editors and operating-system files
+.vscode/
+.idea/
+.DS_Store

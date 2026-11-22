@@ -8,6 +8,19 @@ from kinematic_uuv.env import KNOT_MPS, KinematicUUVEnv
 from kinematic_uuv.teacher import teacher_action
 
 
+def compact_student_observation(observation):
+    """Drop the redundant current frame when history is available."""
+    skip_current_sonar = "sonar_history" in observation
+    return {
+        key: np.asarray(
+            value,
+            dtype=np.float16 if key == "sonar_history" else np.float32,
+        ).copy()
+        for key, value in observation.items()
+        if not (skip_current_sonar and key == "sonar")
+    }
+
+
 def collect_teacher_episode(job):
     """Collect one complete episode, returning None unless the teacher succeeds."""
     if len(job) == 4:
@@ -23,11 +36,11 @@ def collect_teacher_episode(job):
     info = {}
     try:
         while True:
-            action = teacher_action(observation)
-            observations.append({
-                key: np.asarray(value, dtype=np.float32).copy()
-                for key, value in observation.items()
-            })
+            action = teacher_action(
+                observation,
+                path=env.teacher_path_observation(),
+            )
+            observations.append(compact_student_observation(observation))
             actions.append(np.asarray(action, dtype=np.float32).copy())
             observation, _, terminated, truncated, info = env.step(action)
             if terminated or truncated:

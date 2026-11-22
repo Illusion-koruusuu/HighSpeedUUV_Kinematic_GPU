@@ -2,13 +2,14 @@
 import numpy as np
 
 
-def teacher_action(observation):
-    path_yaw = float(observation["path"][1])
-    path_pitch = float(observation["path"][0])
-    cross_track = float(observation["path"][4])
+def teacher_action(observation, path=None):
+    path_observation = observation["path"] if path is None else path
+    path_yaw = float(path_observation[1])
+    path_pitch = float(path_observation[0])
+    cross_track = float(path_observation[4])
     target_pitch = float(observation["target"][0])
     target_yaw = float(observation["target"][1])
-    remaining_distance = float(observation["target"][3]) * 500.0
+    remaining_distance = float(observation["target"][3]) * 1000.0
     motion = observation["motion"]
     speed, cruise, speed_min, speed_max = map(float, motion[:4])
     yaw_rate = float(motion[4])
