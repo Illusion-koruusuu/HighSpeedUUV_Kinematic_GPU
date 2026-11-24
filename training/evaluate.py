@@ -26,7 +26,33 @@ def _make_env(config, episode_steps, moving_obstacles=False,
               obstacle_speed_range=(KNOT_MPS, 10.0 * KNOT_MPS),
               obstacle_turn_rate_rad_s=0.15):
     bounds = config.get("planning_bounds_m")
+    obstacle_count_range = config.get("obstacle_count_range") or [0, 0]
+    obstacle_radius_range = config.get(
+        "obstacle_radius_range_m"
+    ) or [4.0, 22.0]
     kwargs = dict(
+        scene_type=config.get("scene_type", "spheres"),
+        terrain_resolution=config.get("terrain_resolution_m", 20.0),
+        terrain_peak_count_range=tuple(
+            config.get("terrain_peak_count_range", [18, 30])
+        ),
+        terrain_base_height_range=tuple(
+            config.get("terrain_base_height_range_m", [1.0, 7.0])
+        ),
+        terrain_max_height=config.get("terrain_max_height_m", 62.0),
+        terrain_safety_margin=config.get("terrain_safety_margin_m", 8.0),
+        terrain_goal_clearance=config.get(
+            "terrain_goal_clearance_m", 12.0
+        ),
+        terrain_cruise_height=config.get(
+            "terrain_cruise_height_m", 30.0
+        ),
+        include_depth_error_observation=config.get(
+            "include_depth_error_observation",
+            config.get("scene_type", "spheres") == "terrain",
+        ),
+        depth_hold_weight=config.get("depth_hold_weight", 0.2),
+        depth_hold_scale=config.get("depth_hold_scale_m", 10.0),
         dt=config.get("dt", 0.1),
         max_steps=episode_steps,
         speed_min=config.get("speed_min_mps", 1.0),
@@ -42,10 +68,8 @@ def _make_env(config, episode_steps, moving_obstacles=False,
         max_pitch_rate=config.get("max_pitch_rate_rad_s", 0.20),
         max_pitch=config.get("max_pitch_rad", 0.35),
         goal_radius=config.get("goal_radius_m", 5.0),
-        obstacle_count_range=tuple(config.get("obstacle_count_range", [2, 4])),
-        obstacle_radius_range=tuple(
-            config.get("obstacle_radius_range_m", [4.0, 8.0])
-        ),
+        obstacle_count_range=tuple(obstacle_count_range),
+        obstacle_radius_range=tuple(obstacle_radius_range),
         obstacle_distribution=config.get(
             "obstacle_distribution", "uniform"
         ),
@@ -64,7 +88,12 @@ def _make_env(config, episode_steps, moving_obstacles=False,
             "distance_potential_scale", 250.0
         ),
         reward_gamma=config.get("gamma", 0.999),
-        obstacle_motion="random" if moving_obstacles else "static",
+        obstacle_motion=(
+            "random"
+            if moving_obstacles and config.get("scene_type", "spheres")
+            == "spheres"
+            else "static"
+        ),
         obstacle_speed_range=obstacle_speed_range,
         obstacle_turn_rate_rad_s=obstacle_turn_rate_rad_s,
         dijkstra_replan_steps=config.get("dijkstra_replan_steps", 0),
@@ -99,6 +128,10 @@ def _save_trajectory(path, record):
         max_obstacle_speed_mps=np.asarray(
             record.get("max_obstacle_speed_mps", 0.0)
         ),
+        scene_type=np.asarray(record.get("scene_type", "spheres")),
+        terrain_height=np.asarray(record.get("terrain_height", [])),
+        terrain_x=np.asarray(record.get("terrain_x", [])),
+        terrain_y=np.asarray(record.get("terrain_y", [])),
     )
 
 
@@ -110,6 +143,9 @@ def run_episode(env, model, seed, speed_knots):
     speed = [env.state["speed"]]
     actions = []
     yaw_rate = [env.state["yaw_rate"]]
+    terrain_meta = (
+        env.terrain.metadata() if env.terrain is not None else {}
+    )
     obstacles_initial = np.asarray([
         [*center, radius] for center, radius in env.obstacles
     ])
@@ -157,6 +193,7 @@ def run_episode(env, model, seed, speed_knots):
         )),
         "max_abs_pitch_rad": float(np.max(np.abs(np.asarray(rotation)[:, 1]))),
         "obstacle_motion": env.obstacle_motion,
+        "scene_type": env.scene_type,
         "max_obstacle_speed_mps": float(
             env.obstacle_speeds.max()
         ) if env.obstacle_speeds.size else 0.0,
@@ -181,6 +218,7 @@ def run_episode(env, model, seed, speed_knots):
         ]),
         "obstacle_positions": np.asarray(obstacle_positions),
         "obstacle_motion": env.obstacle_motion,
+        "scene_type": env.scene_type,
         "max_obstacle_speed_mps": (
             float(env.obstacle_speeds.max())
             if env.obstacle_speeds.size else 0.0
@@ -191,6 +229,7 @@ def run_episode(env, model, seed, speed_knots):
         "target_speed_knots": speed_knots,
         "dt": env.dt,
     }
+    trajectory.update(terrain_meta)
     return result, trajectory
 
 
@@ -269,8 +308,8 @@ def main():
                         help="PyTorch device: cuda, cuda:0, cpu, or auto")
     parser.add_argument(
         "--moving-obstacles", action=argparse.BooleanOptionalAction,
-        default=True,
-        help="enable random obstacle motion during evaluation only",
+        default=False,
+        help="legacy spherical-scene obstacle motion",
     )
     parser.add_argument(
         "--obstacle-speed-min-knots", type=float, default=1.0,
@@ -293,6 +332,7 @@ def main():
         "kinematic_sonar_lstm_path_v2",
         "kinematic_sonar_goal_v2",
         "kinematic_sonar_lstm_goal_v3",
+        "kinematic_sonar_lstm_seabed_v4",
     }:
         parser.error("model uses an unsupported observation configuration")
     device = resolve_device(args.device)

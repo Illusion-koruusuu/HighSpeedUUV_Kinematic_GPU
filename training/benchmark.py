@@ -131,7 +131,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     csv_dir = args.output / "csv"
     csv_dir.mkdir(parents=True, exist_ok=True)
-    env = KinematicUUVEnv(max_steps=2_000)
+    env = KinematicUUVEnv(max_steps=2_000, scene_type="spheres")
     rows = []
     try:
         for speed_knots in args.speeds_knots:

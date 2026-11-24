@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from kinematic_uuv.env import KNOT_MPS
+from kinematic_uuv.terrain import SeabedTerrain
 
 
 def _trajectory_files(path, speeds, seeds, max_trajectories,
@@ -54,7 +55,19 @@ def _load(path):
         return {key: data[key] for key in data.files}
 
 
-def _clearance(position, obstacles):
+def _terrain_from(data):
+    if "terrain_height" not in data or np.asarray(data["terrain_height"]).size == 0:
+        return None
+    return SeabedTerrain(
+        data["terrain_height"], data["terrain_x"], data["terrain_y"]
+    )
+
+
+def _clearance(position, obstacles, terrain=None):
+    if terrain is not None:
+        return position[:, 2] - terrain.height(
+            position[:, 0], position[:, 1]
+        )
     if len(obstacles) == 0:
         return np.full(len(position), np.inf)
     distances = np.linalg.norm(
@@ -71,6 +84,7 @@ def _summary(data, dt):
     goal = np.asarray(data["goal"], dtype=float)
     goal_radius = float(data.get("goal_radius_m", 5.0))
     obstacles = np.asarray(data["obstacles"], dtype=float)
+    terrain = _terrain_from(data)
     segment_lengths = np.linalg.norm(np.diff(position, axis=0), axis=1)
     return {
         "success": bool(data["success"]),
@@ -81,7 +95,9 @@ def _summary(data, dt):
         "path_length_m": float(segment_lengths.sum()),
         "final_distance_to_goal_m": float(np.linalg.norm(position[-1] - goal)),
         "goal_radius_m": goal_radius,
-        "min_obstacle_clearance_m": float(_clearance(position, obstacles).min()),
+        "min_obstacle_clearance_m": float(
+            _clearance(position, obstacles, terrain).min()
+        ),
         "max_abs_pitch_deg": float(np.rad2deg(np.abs(rotation[:, 1]).max())),
         "max_abs_yaw_rate_deg_s": float(np.rad2deg(np.abs(yaw_rate).max())),
         "max_lat_accel_mps2": float(np.max(np.abs(speed * yaw_rate))),
@@ -105,11 +121,12 @@ def plot_trajectory(data, path, dt):
     rotation = np.asarray(data["roll_pitch_yaw"], dtype=float)
     yaw_rate = np.asarray(data["yaw_rate"], dtype=float)
     obstacles = np.asarray(data["obstacles"], dtype=float)
+    terrain = _terrain_from(data)
     goal = np.asarray(data["goal"], dtype=float)
     goal_radius = float(data.get("goal_radius_m", 5.0))
     time = np.arange(len(speed)) * dt
     distance = np.linalg.norm(position - goal[None, :], axis=1)
-    clearance = _clearance(position, obstacles)
+    clearance = _clearance(position, obstacles, terrain)
 
     fig = plt.figure(figsize=(16, 10), constrained_layout=True)
     grid = fig.add_gridspec(2, 2)
@@ -123,26 +140,44 @@ def plot_trajectory(data, path, dt):
     )
     ax3d.plot(position[:, 0], position[:, 1], position[:, 2],
               color="royalblue", linewidth=1.0, alpha=0.7)
-    for index, obstacle in enumerate(obstacles):
-        _draw_sphere(
-            ax3d, obstacle[:3], float(obstacle[3]), "orange",
-            "obstacle" if index == 0 else "_nolegend_",
+    if terrain is not None:
+        grid_x, grid_y = np.meshgrid(terrain.x_axis, terrain.y_axis)
+        ax3d.plot_surface(
+            grid_x, grid_y, terrain.height_grid,
+            cmap="terrain", linewidth=0, alpha=0.72,
         )
+    else:
+        for index, obstacle in enumerate(obstacles):
+            _draw_sphere(
+                ax3d, obstacle[:3], float(obstacle[3]), "orange",
+                "obstacle" if index == 0 else "_nolegend_",
+            )
     _draw_sphere(ax3d, goal, goal_radius, "limegreen", "goal", alpha=0.25)
     ax3d.scatter(*position[0], color="black", s=55, label="start")
     ax3d.scatter(*position[-1], color="red", s=55, label="end")
     ax3d.set_xlabel("x (m)")
     ax3d.set_ylabel("y (m)")
     ax3d.set_zlabel("z (m)")
-    ax3d.invert_zaxis()
+    if terrain is None:
+        ax3d.invert_zaxis()
     ax3d.view_init(elev=28, azim=-65)
-    plot_bounds = np.vstack((
+    bounds_parts = [
         position,
         goal[None, :] - goal_radius,
         goal[None, :] + goal_radius,
-        obstacles[:, :3] - obstacles[:, 3:4],
-        obstacles[:, :3] + obstacles[:, 3:4],
-    ))
+    ]
+    if terrain is not None:
+        bounds_parts.append(np.array([
+            [terrain.x_axis[0], terrain.y_axis[0], 0.0],
+            [terrain.x_axis[-1], terrain.y_axis[-1],
+             float(terrain.height_grid.max())],
+        ]))
+    elif len(obstacles):
+        bounds_parts.extend([
+            obstacles[:, :3] - obstacles[:, 3:4],
+            obstacles[:, :3] + obstacles[:, 3:4],
+        ])
+    plot_bounds = np.vstack(bounds_parts)
     spans = np.maximum(plot_bounds.max(axis=0) - plot_bounds.min(axis=0), 1e-6)
     ax3d.set_box_aspect(spans)
     ax3d.set_title(

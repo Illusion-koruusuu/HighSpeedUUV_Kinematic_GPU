@@ -27,6 +27,7 @@ OBSERVATION_TYPE = "kinematic_sonar_path_v1"
 OBSERVATION_TYPE_LSTM = "kinematic_sonar_lstm_path_v2"
 OBSERVATION_TYPE_GOAL = "kinematic_sonar_goal_v2"
 OBSERVATION_TYPE_LSTM_GOAL = "kinematic_sonar_lstm_goal_v3"
+OBSERVATION_TYPE_LSTM_SEABED = "kinematic_sonar_lstm_seabed_v4"
 
 
 def knots(values):
@@ -34,9 +35,17 @@ def knots(values):
 
 
 def _observation_type(sonar_history_length,
-                      include_path_observation=True):
+                      include_path_observation=True,
+                      scene_type="spheres",
+                      include_depth_error_observation=False):
     return (
-        OBSERVATION_TYPE_LSTM_GOAL
+        OBSERVATION_TYPE_LSTM_SEABED
+        if (
+            sonar_history_length > 0
+            and scene_type == "terrain"
+            and include_depth_error_observation
+        )
+        else OBSERVATION_TYPE_LSTM_GOAL
         if sonar_history_length > 0 and not include_path_observation
         else OBSERVATION_TYPE_GOAL
         if not include_path_observation
@@ -55,18 +64,22 @@ def _run_metadata(args, env, full_speed_range, device):
         "algorithm": "PPO",
         "policy_mode": (
             "resumed_ppo" if args.resume_model is not None
-            else "static_bc_to_dynamic_residual_ppo"
+            else "static_terrain_bc_to_residual_ppo"
             if args.bc_steps and args.residual_policy
-            else "static_bc_to_dynamic_ppo" if args.bc_steps
+            else "static_terrain_bc_to_ppo" if args.bc_steps
             else "pure_ppo"
         ),
         "policy_action_distribution": ACTION_DISTRIBUTION,
         "observation_type": _observation_type(
-            args.sonar_history_length, env.include_path_observation
+            args.sonar_history_length,
+            env.include_path_observation,
+            env.scene_type,
+            env.include_depth_error_observation,
         ),
         "training_status": "running",
-        "bc_obstacle_motion": "static" if args.bc_steps else None,
-        "ppo_obstacle_motion": env.obstacle_motion,
+        "scene_type": env.scene_type,
+        "bc_scene_motion": "static" if args.bc_steps else None,
+        "ppo_scene_motion": env.obstacle_motion,
         "ppo_uses_dijkstra": env.use_dijkstra,
         "include_path_observation": env.include_path_observation,
         "ppo_reward_mode": env.reward_mode,
@@ -96,10 +109,27 @@ def _run_metadata(args, env, full_speed_range, device):
         "max_pitch_rate_rad_s": env.max_pitch_rate,
         "max_pitch_rad": env.max_pitch,
         "goal_radius_m": env.goal_radius,
-        "obstacle_count_range": [env.obstacle_count_min,
-                                 env.obstacle_count_max],
-        "obstacle_radius_range_m": [env.obstacle_radius_min,
-                                    env.obstacle_radius_max],
+        "obstacle_count_range": (
+            [env.obstacle_count_min, env.obstacle_count_max]
+            if env.scene_type == "spheres" else None
+        ),
+        "obstacle_radius_range_m": (
+            [env.obstacle_radius_min, env.obstacle_radius_max]
+            if env.scene_type == "spheres" else None
+        ),
+        "terrain_resolution_m": env.terrain_resolution,
+        "terrain_peak_count_range": [
+            env.terrain_peak_count_min, env.terrain_peak_count_max
+        ],
+        "terrain_base_height_range_m": list(env.terrain_base_height_range),
+        "terrain_max_height_m": env.terrain_max_height,
+        "terrain_safety_margin_m": env.terrain_safety_margin,
+        "terrain_goal_clearance_m": env.terrain_goal_clearance,
+        "terrain_cruise_height_m": env.terrain_cruise_height,
+        "include_depth_error_observation":
+            env.include_depth_error_observation,
+        "depth_hold_weight": env.depth_hold_weight,
+        "depth_hold_scale_m": env.depth_hold_scale,
         "obstacle_distribution": env.obstacle_distribution,
         "obstacle_motion": env.obstacle_motion,
         "obstacle_speed_range_mps": [
@@ -526,14 +556,33 @@ def main():
         help="PPO minibatch size; default is 1024 when the rollout permits it",
     )
     parser.add_argument("--num-envs", type=int, default=8)
-    parser.add_argument("--min-obstacles", type=int, default=300)
-    parser.add_argument("--max-obstacles", type=int, default=450)
+    parser.add_argument("--scene-type", choices=("terrain", "spheres"),
+                        default="terrain")
+    parser.add_argument("--terrain-resolution", type=float, default=20.0)
+    parser.add_argument("--min-terrain-peaks", type=int, default=18)
+    parser.add_argument("--max-terrain-peaks", type=int, default=30)
+    parser.add_argument("--terrain-base-height-min", type=float, default=1.0)
+    parser.add_argument("--terrain-base-height-max", type=float, default=7.0)
+    parser.add_argument("--terrain-max-height", type=float, default=62.0)
+    parser.add_argument("--terrain-safety-margin", type=float, default=8.0)
+    parser.add_argument("--terrain-goal-clearance", type=float, default=12.0)
+    parser.add_argument("--terrain-cruise-height", type=float, default=30.0)
+    parser.add_argument("--depth-hold-weight", type=float, default=0.2)
+    parser.add_argument("--depth-hold-scale", type=float, default=10.0)
+    parser.add_argument(
+        "--min-obstacles", type=int, default=300,
+        help="legacy spherical-scene option",
+    )
+    parser.add_argument(
+        "--max-obstacles", type=int, default=450,
+        help="legacy spherical-scene option",
+    )
     parser.add_argument("--obstacle-radius-min", type=float, default=None)
     parser.add_argument("--obstacle-radius-max", type=float, default=None)
     parser.add_argument("--obstacle-distribution", choices=("uniform",),
                         default="uniform")
     parser.add_argument("--obstacle-motion", choices=("static", "random"),
-                        default="random")
+                        default="static")
     parser.add_argument("--obstacle-speed-min-knots", type=float, default=1.0)
     parser.add_argument("--obstacle-speed-max-knots", type=float, default=10.0)
     parser.add_argument("--obstacle-turn-rate-rad-s", type=float, default=0.15)
@@ -632,6 +681,26 @@ def main():
         parser.error("invalid obstacle count range")
     if radius_min <= 0.0 or radius_max < radius_min:
         parser.error("invalid obstacle radius range")
+    if args.terrain_resolution <= 0.0:
+        parser.error("terrain-resolution must be positive")
+    if (args.min_terrain_peaks < 0
+            or args.max_terrain_peaks < args.min_terrain_peaks):
+        parser.error("invalid terrain peak count range")
+    if (args.terrain_base_height_min < 0.0
+            or args.terrain_base_height_max < args.terrain_base_height_min):
+        parser.error("invalid terrain base height range")
+    if args.terrain_max_height <= args.terrain_base_height_max:
+        parser.error("terrain-max-height must exceed the base height")
+    if args.terrain_safety_margin < 0.0:
+        parser.error("terrain-safety-margin must be nonnegative")
+    if args.terrain_goal_clearance <= 0.0:
+        parser.error("terrain-goal-clearance must be positive")
+    if args.terrain_cruise_height <= 0.0:
+        parser.error("terrain-cruise-height must be positive")
+    if args.depth_hold_weight < 0.0:
+        parser.error("depth-hold-weight must be nonnegative")
+    if args.depth_hold_scale <= 0.0:
+        parser.error("depth-hold-scale must be positive")
     if args.obstacle_speed_min_knots < 0.0 or (
             args.obstacle_speed_max_knots < args.obstacle_speed_min_knots):
         parser.error("invalid obstacle speed range")
@@ -712,6 +781,21 @@ def main():
     logger = configure(str(csv_dir), ["stdout", "csv"])
     full_speed_range = knots((args.target_speed_knots, args.target_speed_knots))
     env_kwargs = {
+        "scene_type": args.scene_type,
+        "terrain_resolution": args.terrain_resolution,
+        "terrain_peak_count_range": (
+            args.min_terrain_peaks, args.max_terrain_peaks
+        ),
+        "terrain_base_height_range": (
+            args.terrain_base_height_min, args.terrain_base_height_max
+        ),
+        "terrain_max_height": args.terrain_max_height,
+        "terrain_safety_margin": args.terrain_safety_margin,
+        "terrain_goal_clearance": args.terrain_goal_clearance,
+        "terrain_cruise_height": args.terrain_cruise_height,
+        "include_depth_error_observation": args.scene_type == "terrain",
+        "depth_hold_weight": args.depth_hold_weight,
+        "depth_hold_scale": args.depth_hold_scale,
         "obstacle_count_range": (min_obstacles, max_obstacles),
         "obstacle_radius_range": (radius_min, radius_max),
         "obstacle_distribution": args.obstacle_distribution,
@@ -1000,10 +1084,12 @@ def main():
                     "policy_mode": "bc_only",
                     "policy_action_distribution": ACTION_DISTRIBUTION,
                     "observation_type": _observation_type(
-                        args.sonar_history_length, False
+                        args.sonar_history_length, False,
+                        base_env.scene_type, True,
                     ),
-                    "bc_obstacle_motion": "static",
-                    "ppo_obstacle_motion": None,
+                    "scene_type": base_env.scene_type,
+                    "bc_scene_motion": "static",
+                    "ppo_scene_motion": None,
                     "ppo_uses_dijkstra": False,
                     "include_path_observation": False,
                     "ppo_reward_mode": "euclidean",
@@ -1030,13 +1116,30 @@ def main():
                     "max_pitch_rate_rad_s": base_env.max_pitch_rate,
                     "max_pitch_rad": base_env.max_pitch,
                     "goal_radius_m": base_env.goal_radius,
-                    "obstacle_count_range": [base_env.obstacle_count_min,
-                                             base_env.obstacle_count_max],
-                    "obstacle_radius_range_m": [
-                        base_env.obstacle_radius_min,
-                        base_env.obstacle_radius_max,
-                    ],
+                    "obstacle_count_range": (
+                        [base_env.obstacle_count_min,
+                         base_env.obstacle_count_max]
+                        if base_env.scene_type == "spheres" else None
+                    ),
+                    "obstacle_radius_range_m": (
+                        [base_env.obstacle_radius_min,
+                         base_env.obstacle_radius_max]
+                        if base_env.scene_type == "spheres" else None
+                    ),
                     "obstacle_distribution": base_env.obstacle_distribution,
+                    "terrain_resolution_m": base_env.terrain_resolution,
+                    "terrain_peak_count_range": [
+                        base_env.terrain_peak_count_min,
+                        base_env.terrain_peak_count_max,
+                    ],
+                    "terrain_base_height_range_m":
+                        list(base_env.terrain_base_height_range),
+                    "terrain_max_height_m": base_env.terrain_max_height,
+                    "terrain_cruise_height_m":
+                        base_env.terrain_cruise_height,
+                    "include_depth_error_observation": True,
+                    "depth_hold_weight": base_env.depth_hold_weight,
+                    "depth_hold_scale_m": base_env.depth_hold_scale,
                     "sensor_backend": base_env.sensor_backend,
                     "sensor_device": base_env.sensor_device,
                     "goal_distance_range_m": list(base_env.goal_distance_range),
@@ -1095,7 +1198,7 @@ def main():
                 encoding="utf-8",
             )
             print(
-                f"Dynamic PPO baseline: "
+                f"PPO baseline: "
                 f"success={ppo_initial_eval['success_rate']:.0%}",
                 flush=True,
             )

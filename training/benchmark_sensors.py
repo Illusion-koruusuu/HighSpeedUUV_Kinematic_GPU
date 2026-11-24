@@ -16,6 +16,7 @@ def benchmark_backend(backend, sensor_device, min_obstacles, max_obstacles,
                       steps, warmup, seed):
     env = KinematicUUVEnv(
         max_steps=steps + warmup + 10,
+        scene_type="spheres",
         obstacle_count_range=(min_obstacles, max_obstacles),
         sensor_backend=backend,
         sensor_device=sensor_device,

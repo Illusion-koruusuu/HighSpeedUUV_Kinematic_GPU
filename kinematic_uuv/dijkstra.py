@@ -9,7 +9,8 @@ def build_cost_field(goal, obstacles, start, resolution=8.0,
                      planning_bounds=((-100.0, -350.0, 0.0),
                                       (700.0, 350.0, 100.0)),
                      vertical_cost_scale=2.0,
-                     planner_goal_radius=0.0):
+                     planner_goal_radius=0.0,
+                     terrain_height=None):
     """Build reverse distances to one goal cell or an optional goal region.
 
     The default targets only the grid cell nearest the goal center. A positive
@@ -34,6 +35,12 @@ def build_cost_field(goal, obstacles, start, resolution=8.0,
         occupancy |= ((grid_x - center[0]) ** 2
                       + (grid_y - center[1]) ** 2
                       + (grid_z - center[2]) ** 2 <= inflated ** 2)
+    if terrain_height is not None:
+        surface = np.asarray(
+            terrain_height(grid_x[:, :, 0], grid_y[:, :, 0]),
+            dtype=np.float32,
+        )
+        occupancy |= grid_z <= (surface[:, :, None] + obstacle_margin)
 
     if planner_goal_radius > 0.0:
         goal_grid = ((grid_x - goal[0]) ** 2

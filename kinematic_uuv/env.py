@@ -7,6 +7,7 @@ from gymnasium import spaces
 
 from .dijkstra import build_cost_field, interpolate_cost
 from .sensors import SonarArray, TorchSonarArray
+from .terrain import SeabedTerrain
 
 
 KNOT_MPS = 0.5144444444
@@ -34,6 +35,17 @@ class KinematicUUVEnv(gym.Env):
         max_pitch_rate=0.20,
         max_pitch=0.35,
         goal_distance_range=(650.0, 900.0),
+        scene_type="terrain",
+        terrain_resolution=20.0,
+        terrain_peak_count_range=(18, 30),
+        terrain_base_height_range=(1.0, 7.0),
+        terrain_max_height=62.0,
+        terrain_safety_margin=8.0,
+        terrain_goal_clearance=12.0,
+        terrain_cruise_height=30.0,
+        include_depth_error_observation=True,
+        depth_hold_weight=0.2,
+        depth_hold_scale=10.0,
         obstacle_count_range=(20, 32),
         obstacle_radius_range=(4.0, 22.0),
         obstacle_distribution="uniform",
@@ -74,6 +86,39 @@ class KinematicUUVEnv(gym.Env):
         self.max_pitch_rate = float(max_pitch_rate)
         self.max_pitch = float(max_pitch)
         self.goal_distance_range = tuple(float(v) for v in goal_distance_range)
+        self.scene_type = str(scene_type)
+        if self.scene_type not in {"terrain", "spheres"}:
+            raise ValueError("scene_type must be 'terrain' or 'spheres'")
+        self.terrain_resolution = float(terrain_resolution)
+        self.terrain_peak_count_min, self.terrain_peak_count_max = map(
+            int, terrain_peak_count_range
+        )
+        self.terrain_base_height_range = tuple(
+            float(v) for v in terrain_base_height_range
+        )
+        self.terrain_max_height = float(terrain_max_height)
+        self.terrain_safety_margin = float(terrain_safety_margin)
+        self.terrain_goal_clearance = float(terrain_goal_clearance)
+        self.terrain_cruise_height = float(terrain_cruise_height)
+        self.include_depth_error_observation = bool(
+            include_depth_error_observation
+        )
+        self.depth_hold_weight = float(depth_hold_weight)
+        self.depth_hold_scale = float(depth_hold_scale)
+        if self.terrain_resolution <= 0.0:
+            raise ValueError("terrain_resolution must be positive")
+        if (self.terrain_peak_count_min < 0
+                or self.terrain_peak_count_max < self.terrain_peak_count_min):
+            raise ValueError("invalid terrain peak count range")
+        if self.terrain_max_height <= 0.0:
+            raise ValueError("terrain_max_height must be positive")
+        if (self.terrain_safety_margin < 0.0
+                or self.terrain_goal_clearance <= 0.0):
+            raise ValueError("invalid terrain clearance parameters")
+        if self.depth_hold_weight < 0.0:
+            raise ValueError("depth_hold_weight must be nonnegative")
+        if self.depth_hold_scale <= 0.0:
+            raise ValueError("depth_hold_scale must be positive")
         self.obstacle_count_min, self.obstacle_count_max = map(
             int, obstacle_count_range
         )
@@ -132,6 +177,8 @@ class KinematicUUVEnv(gym.Env):
         self.obstacle_turn_rate_rad_s = float(obstacle_turn_rate_rad_s)
         if self.obstacle_turn_rate_rad_s < 0.0:
             raise ValueError("obstacle turn rate must be nonnegative")
+        if self.scene_type == "terrain":
+            self.obstacle_motion = "static"
         self.dijkstra_replan_steps = int(dijkstra_replan_steps)
         if self.dijkstra_replan_steps < 0:
             raise ValueError("dijkstra_replan_steps must be nonnegative")
@@ -159,6 +206,8 @@ class KinematicUUVEnv(gym.Env):
             "pitch_rate": 0.0,
         }
         self.goal = np.zeros(3, dtype=float)
+        self.terrain = None
+        self.depth_reference = None
         self.obstacles = []
         self.cruise_speed = float(np.mean(self.cruise_speed_range))
         self.cruise_speed_override = None
@@ -176,11 +225,14 @@ class KinematicUUVEnv(gym.Env):
         self._cached_path = None
 
         self.action_space = spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+        motion_dimension = 8 if self.include_depth_error_observation else 7
         observation_spaces = {
             "sonar": spaces.Box(0.0, 1.0, shape=self.sonar.observation_shape,
                                dtype=np.float32),
             "target": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
-            "motion": spaces.Box(-np.inf, np.inf, shape=(7,), dtype=np.float32),
+            "motion": spaces.Box(
+                -np.inf, np.inf, shape=(motion_dimension,), dtype=np.float32
+            ),
         }
         if self.include_path_observation:
             observation_spaces["path"] = spaces.Box(
@@ -220,7 +272,9 @@ class KinematicUUVEnv(gym.Env):
         return bool(np.any(position < lower) or np.any(position > upper))
 
     def _initialize_obstacle_motion(self):
-        if self.obstacle_motion == "static" or not self.obstacles:
+        if (self.scene_type != "spheres"
+                or self.obstacle_motion == "static"
+                or not self.obstacles):
             self.obstacle_velocities = np.empty((0, 3), dtype=float)
             self.obstacle_speeds = np.empty((0,), dtype=float)
             return
@@ -237,7 +291,9 @@ class KinematicUUVEnv(gym.Env):
         self.obstacle_velocities = directions * self.obstacle_speeds[:, None]
 
     def _update_obstacles(self):
-        if self.obstacle_motion == "static" or not self.obstacles:
+        if (self.scene_type != "spheres"
+                or self.obstacle_motion == "static"
+                or not self.obstacles):
             return
         noise = self.np_random.normal(
             size=self.obstacle_velocities.shape
@@ -268,24 +324,30 @@ class KinematicUUVEnv(gym.Env):
             self.sonar.set_obstacles(self.obstacles)
 
     def _sample_scene(self):
-        start = np.array([0.0, 0.0, 10.0], dtype=float)
-        distance = self.np_random.uniform(*self.goal_distance_range)
-        yaw = self.np_random.uniform(-np.pi / 4.0, np.pi / 4.0)
-        pitch = self.np_random.uniform(-np.pi / 12.0, np.pi / 12.0)
-        depth = np.clip(start[2] - distance * np.sin(pitch), 8.0, 75.0)
-        # Preserve the sampled 3D distance after limiting the goal depth.
-        horizontal_distance = np.sqrt(distance**2 - (depth - start[2])**2)
-        self.goal = np.array([
-            horizontal_distance * np.cos(yaw),
-            horizontal_distance * np.sin(yaw),
-            depth,
-        ])
         if self.cruise_speed_override is None:
             self.cruise_speed = float(self.np_random.uniform(
                 *self.cruise_speed_range
             ))
         else:
             self.cruise_speed = float(self.cruise_speed_override)
+        if self.scene_type == "spheres":
+            self._sample_sphere_scene()
+        else:
+            self._sample_terrain_scene()
+
+    def _sample_sphere_scene(self):
+        start = np.array([0.0, 0.0, 10.0], dtype=float)
+        self.terrain = None
+        distance = self.np_random.uniform(*self.goal_distance_range)
+        yaw = self.np_random.uniform(-np.pi / 4.0, np.pi / 4.0)
+        pitch = self.np_random.uniform(-np.pi / 12.0, np.pi / 12.0)
+        depth = np.clip(start[2] - distance * np.sin(pitch), 8.0, 75.0)
+        horizontal_distance = np.sqrt(distance**2 - (depth - start[2])**2)
+        self.goal = np.array([
+            horizontal_distance * np.cos(yaw),
+            horizontal_distance * np.sin(yaw),
+            depth,
+        ])
         count = int(self.np_random.integers(
             self.obstacle_count_min, self.obstacle_count_max + 1
         ))
@@ -295,6 +357,49 @@ class KinematicUUVEnv(gym.Env):
                 self.obstacles = obstacles
                 return
         raise RuntimeError("failed to generate a valid obstacle scene")
+
+    def _sample_terrain_scene(self):
+        start_xy = np.zeros(2, dtype=float)
+        self.terrain = SeabedTerrain.sample(
+            self.np_random,
+            self.planning_bounds,
+            resolution=self.terrain_resolution,
+            peak_count_range=(
+                self.terrain_peak_count_min,
+                self.terrain_peak_count_max,
+            ),
+            base_height_range=self.terrain_base_height_range,
+            max_height=self.terrain_max_height,
+            start_xy=start_xy,
+        )
+        self.obstacles = []
+        self.obstacle_velocities = np.empty((0, 3), dtype=float)
+        self.obstacle_speeds = np.empty((0,), dtype=float)
+
+        start_height = float(self.terrain.height(0.0, 0.0))
+        start_z = max(
+            self.terrain_cruise_height,
+            start_height + self.terrain_goal_clearance,
+        )
+        self.state["position"] = np.array([0.0, 0.0, start_z], dtype=float)
+        upper = self.planning_bounds[1]
+        for _attempt in range(50):
+            distance = float(self.np_random.uniform(*self.goal_distance_range))
+            yaw = float(self.np_random.uniform(-np.pi / 4.0, np.pi / 4.0))
+            goal_xy = np.array([
+                distance * np.cos(yaw),
+                distance * np.sin(yaw),
+            ])
+            local_height = float(self.terrain.height(
+                goal_xy[0], goal_xy[1]
+            ))
+            if (local_height + self.terrain_goal_clearance <= start_z
+                    and start_z <= upper[2] - 2.0):
+                self.goal = np.array([
+                    goal_xy[0], goal_xy[1], start_z
+                ], dtype=float)
+                return
+        raise RuntimeError("failed to generate a valid seabed scene")
 
     def _sample_radius(self):
         draw = float(self.np_random.random())
@@ -345,11 +450,18 @@ class KinematicUUVEnv(gym.Env):
                 self.obstacles,
                 self.state["position"],
                 resolution=self.dijkstra_resolution,
-                obstacle_margin=15.0,
+                obstacle_margin=(
+                    self.terrain_safety_margin
+                    if self.terrain is not None else 15.0
+                ),
                 goal_radius=self.goal_radius,
                 planner_goal_radius=0.0,
                 planning_bounds=self.planning_bounds,
                 vertical_cost_scale=self.vertical_cost_scale,
+                terrain_height=(
+                    self.terrain.height
+                    if self.terrain is not None else None
+                ),
             )
 
     def _dijkstra_cost(self, position):
@@ -479,7 +591,8 @@ class KinematicUUVEnv(gym.Env):
             self.state["position"][2], 0.0, self.state["pitch"],
             self.state["yaw"],
         ])
-        sonar = self.sonar.observe(eta, self.obstacles)
+        scene = self.terrain if self.terrain is not None else self.obstacles
+        sonar = self.sonar.observe(eta, scene)
         if self.sonar_history_length > 0:
             self._sonar_history.append(sonar.copy())
             frames = list(self._sonar_history)
@@ -501,7 +614,7 @@ class KinematicUUVEnv(gym.Env):
             self.cruise_speed - self.state["speed"],
             float(np.clip(distance / 1000.0, 0.0, 1.0)),
         ], dtype=np.float32)
-        motion = np.array([
+        motion_values = [
             self.state["speed"],
             self.cruise_speed,
             self.speed_min,
@@ -509,7 +622,16 @@ class KinematicUUVEnv(gym.Env):
             self.state["yaw_rate"],
             self.state["pitch"],
             self.state["pitch_rate"],
-        ], dtype=np.float32)
+        ]
+        if self.include_depth_error_observation:
+            reference = (
+                self.state["position"][2]
+                if self.depth_reference is None else self.depth_reference
+            )
+            motion_values.append(
+                (self.state["position"][2] - reference) / self.depth_hold_scale
+            )
+        motion = np.asarray(motion_values, dtype=np.float32)
         observation = {
             "sonar": sonar,
             "target": target,
@@ -537,6 +659,7 @@ class KinematicUUVEnv(gym.Env):
         if self.use_dijkstra:
             for _attempt in range(10):
                 self._sample_scene()
+                self.depth_reference = float(self.state["position"][2])
                 self._build_cost_field()
                 if np.isfinite(self._dijkstra_cost(self.state["position"])):
                     break
@@ -545,13 +668,15 @@ class KinematicUUVEnv(gym.Env):
             self._cached_path = self._plan_path(self.state["position"])
         else:
             self._sample_scene()
+            self.depth_reference = float(self.state["position"][2])
             self._cost_field = None
             self._cost_origin = None
             self._cost_occupancy = None
             self._cached_path = None
         self._initialize_obstacle_motion()
-        if hasattr(self.sonar, "set_obstacles"):
-            self.sonar.set_obstacles(self.obstacles)
+        scene = self.terrain if self.terrain is not None else self.obstacles
+        if hasattr(self.sonar, "set_scene"):
+            self.sonar.set_scene(scene)
         return self._observe(), {}
 
     def _current_path(self):
@@ -703,6 +828,14 @@ class KinematicUUVEnv(gym.Env):
         )
         goal_proximity = 1.0 - float(np.clip(distance / 100.0, 0.0, 1.0))
         safety_penalty = max(0.0, 15.0 - clearance) / 15.0
+        depth_reference = (
+            self.state["position"][2]
+            if self.depth_reference is None else self.depth_reference
+        )
+        depth_error = abs(self.state["position"][2] - depth_reference)
+        depth_hold_penalty = self.depth_hold_weight * min(
+            (depth_error / self.depth_hold_scale) ** 2, 1.0
+        )
         if self.reward_mode == "dijkstra":
             reward = (
                 dijkstra_shaping
@@ -718,6 +851,7 @@ class KinematicUUVEnv(gym.Env):
                 distance_shaping
                 - 0.3 * speed_error
                 - 0.2 * safety_penalty
+                - depth_hold_penalty
                 - 0.02
             )
         if reached:
@@ -743,8 +877,12 @@ class KinematicUUVEnv(gym.Env):
             "distance_shaping": float(distance_shaping),
             "distance_potential": float(distance_potential),
             "direct_progress": direct_progress,
+            "depth_reference_m": float(depth_reference),
+            "depth_hold_error_m": float(depth_error),
+            "depth_hold_penalty": float(depth_hold_penalty),
             "alignment_error": alignment_error,
             "reward_mode": self.reward_mode,
+            "scene_type": self.scene_type,
             "obstacle_motion": self.obstacle_motion,
             "max_obstacle_speed_mps": float(self.obstacle_speeds.max())
                 if self.obstacle_speeds.size else 0.0,

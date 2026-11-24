@@ -86,11 +86,15 @@ cd /path/to/HighSpeedUUV_Kinematic
 - 最大俯仰角和俯仰角速度
 - 偏航/俯仰角加速度限制
 
-场景默认在整个三维规划空间中均匀随机生成 20–32 个障碍物；GPU
-高密度实验通常使用 `--min-obstacles 100 --max-obstacles 150`。
-起终点的实际三维直线距离默认随机采样为 650–900 m，规划空间为
+当前默认场景为静态海底山地高度场（heightfield terrain），不再生成悬浮球形
+障碍物，也不再让障碍物运动。地形由 18–30 个不同尺度的山体叠加低频起伏生成，
+高度范围约为 0–62 m。默认巡航高度为 30 m，起点和目标点保持同一高度。
+UUV 需要从山峰之间穿过，或在必要时进行短时高度调整后回到巡航深度。
+
+起终点三维距离默认随机采样为 650–900 m，规划空间为
 X ∈ [-100, 1100] m、Y ∈ [-750, 750] m、Z ∈ [0, 100] m。
-障碍半径采用 4–22 m 的混合分布，其中包含更多 14–22 m 的大半径障碍物。
+地形使用 `z <= h(x,y)` 表示固体区域，声呐、碰撞、净距和 Dijkstra 都直接读取
+海床高度场。
 
 这样高速时自动限制转弯角速度，避免“高速大角度急转弯”。
 
@@ -99,7 +103,7 @@ X ∈ [-100, 1100] m、Y ∈ [-750, 750] m、Z ∈ [0, 100] m。
 ```text
 sonar  : (6, 12, 48) 三路几何声呐
 target : 目标俯仰、偏航、速度误差、归一化距离
-motion : 当前速度、巡航速度、速度上下限、偏航率、俯仰、俯仰率
+motion : 当前速度、巡航速度、速度上下限、偏航率、俯仰、俯仰率、深度误差
 ```
 
 当前学生策略观测不包含 Dijkstra 路径。Dijkstra 只作为教师内部信息，用于静态
@@ -110,23 +114,22 @@ BC/DAgger 数据生成；PPO 完全根据声呐历史、目标方向/距离和�
 默认流程：
 
 1. 默认目标速度固定为 50 节，不再随机训练 10–40 节；
-2. BC、DAgger 和 BC 评估只使用静态障碍；
+2. BC、DAgger 和 PPO 都使用同一类静态海底地形；
 3. 教师使用 Dijkstra 路径生成专家动作，但学生观测中不包含路径；
-4. BC 和 DAgger 完成后，在静态场景上执行成功率门槛判断；
-5. PPO 切换到动态障碍，不再构建、重规划或奖励 Dijkstra 代价场；
+4. BC 和 DAgger 完成后，在静态地形上执行成功率门槛判断；
+5. PPO 不再构建或奖励 Dijkstra 代价场，但仍使用静态海底地形；
 6. PPO 使用低权重欧氏距离势函数，并保留速度、安全与终端奖励；
 7. 默认只在 50 节上评估，并保留最佳 checkpoint。
 
 ```bash
 cd /path/to/HighSpeedUUV_Kinematic
 ./scripts/train.sh \
-  --output output_model/static_bc_dynamic_ppo \
+  --output output_model/seabed_terrain_ppo \
   --overwrite
 ```
 
 当前默认配置为 30 万步 PPO、8 路并行采样、每路 512 步 rollout、1024 的
-PPO batch、300–450 个障碍、50 节目标速度，以及 LSTM + 残差 PPO。BC 阶段使用
-静态障碍，PPO 阶段使用 1–10 节动态障碍。
+PPO batch、18–30 个海床山体、50 节目标速度，以及 LSTM + 残差 PPO。
 `n_steps` 和 `batch_size` 会根据并行环境数自动选择；使用默认 8 路环境时分别
 解析为 512 和 1024。
 
@@ -137,11 +140,11 @@ PPO batch、300–450 个障碍、50 节目标速度，以及 LSTM + 残差 PPO�
 BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛可通过
 `--bc-min-success-rate` 修改；仅调试流程时可使用 `--allow-low-bc` 跳过门槛。
 
-DAgger 默认执行 2 轮，每轮采集 30,000 步 BC 实际访问状态，并用教师动作
+DAgger 默认执行 8 轮，每轮采集 30,000 步 BC 实际访问状态，并用教师动作
 进行纠正。可通过以下参数调整：
 
 ```text
---dagger-rounds 2
+--dagger-rounds 8
 --dagger-steps 30000
 --dagger-workers 4
 --dagger-epochs 5
@@ -151,17 +154,14 @@ DAgger 默认执行 2 轮，每轮采集 30,000 步 BC 实际访问状态，并�
 
 设置 `--dagger-rounds 0` 可以关闭 DAgger。
 
-## 从现有模型继续动态障碍 PPO
+## 从现有模型继续海底地形 PPO
 
 使用 `--resume-model` 可以加载同版无路径观测的 checkpoint，自动跳过 BC 和
 DAgger 数据采集。旧版包含 `path` 观测的模型不能直接加载：
 
 ```bash
 ./scripts/train.sh \
-  --resume-model output_model/static_bc_dynamic_ppo/bc_model.zip \
-  --obstacle-motion random \
-  --obstacle-speed-min-knots 1 \
-  --obstacle-speed-max-knots 10 \
+  --resume-model output_model/seabed_terrain_ppo/bc_model.zip \
   --timesteps 300000 \
   --num-envs 8 \
   --sensor-backend gpu \
@@ -171,7 +171,7 @@ DAgger 数据采集。旧版包含 `path` 观测的模型不能直接加载：
   --bc-finetune-learning-rate 3e-5 \
   --resume-log-std -2.0 \
   --target-kl 0.02 \
-  --output output_model/ppo_v7_dynamic \
+  --output output_model/seabed_terrain_resume \
   --overwrite
 ```
 
@@ -187,6 +187,15 @@ r_distance = gamma * Phi_d(s_next) - Phi_d(s)
 默认 `distance_potential_scale=250`。这种写法比直接奖励
 `old_distance - new_distance` 更稳定，避免策略通过重复绕行累积距离奖励。
 最终 PPO 奖励主要由低权重距离势函数、速度误差、安全净距和到达/碰撞终端项组成。
+定深奖励会惩罚相对参考巡航高度的偏差：
+
+```text
+r_depth = -depth_hold_weight
+          * min((|z - z_reference| / depth_hold_scale)^2, 1)
+```
+
+默认 `depth_hold_weight=0.2`、`depth_hold_scale=10 m`。学生观测中的 `motion`
+新增归一化深度误差，使策略能够主动回到巡航深度。
 
 Dijkstra 只保留在静态教师采集中。由于 PPO 不再访问代价场，
 `--dijkstra-replan-steps` 不会影响 PPO 阶段的速度或奖励。
@@ -247,23 +256,8 @@ BC 成功率门槛使用静态场景，只决定是否进入 PPO。进入 PPO �
 策略评估默认使用 `--device cuda`；如需显式指定 GPU，可传入
 `--device cuda:0`。
 
-评估默认启用随机运动的障碍物，训练环境仍然保持静态。障碍默认速度为
-1–10 节，可通过以下参数控制：
-
-```text
---moving-obstacles
---obstacle-speed-min-knots 1
---obstacle-speed-max-knots 10
---obstacle-turn-rate-rad-s 0.15
-```
-
-障碍物速度上限不得超过 UUV 最大速度。需要静态对照时使用：
-
-```bash
-./scripts/evaluate.sh output_model/kinematic_ppo/ppo_kinematic.zip \
-  --episodes-per-speed 20 --speeds-knots 50 \
-  --no-moving-obstacles
-```
+当前场景为静态海底山地，不存在移动障碍物。`--moving-obstacles` 和障碍速度参数
+仅保留给旧版球形障碍 checkpoint 的兼容评估。
 
 输出：
 
@@ -273,8 +267,8 @@ BC 成功率门槛使用静态场景，只决定是否进入 PPO。进入 PPO �
 - `evaluation.png`
 - `trajectories/*.npz`：可用于 HoloOcean 回放的轨迹
 
-动态障碍评估的轨迹会额外保存 `obstacle_positions`、`obstacles_initial`、
-`obstacles_final` 和 `max_obstacle_speed_mps`。
+地形轨迹会额外保存 `terrain_height`、`terrain_x` 和 `terrain_y`，用于轨迹诊断、
+实时播放和场景复现。
 
 评估同时记录：
 
@@ -292,8 +286,8 @@ BC 成功率门槛使用静态场景，只决定是否进入 PPO。进入 PPO �
 ## 轨迹可视化验证
 
 策略评估会生成 `trajectories/*.npz`。可视化程序会为每条轨迹生成一张
-诊断图，包含三维轨迹、障碍物、目标球、速度跟踪、俯仰/偏航、目标距离和
-障碍物净距：
+诊断图，包含三维轨迹、海床地形、目标球、速度跟踪、俯仰/偏航、目标距离和
+海床净距：
 
 ```bash
 ./scripts/evaluate.sh output_model/kinematic_ppo_v2/ppo_kinematic.zip \
@@ -322,17 +316,17 @@ BC 成功率门槛使用静态场景，只决定是否进入 PPO。进入 PPO �
 
 ## 场景分布可视化
 
-批量生成默认场景并检查障碍物在三维空间中的分布：
+批量生成默认海床地形并检查山体分布、直接路径阻挡和 Dijkstra 可达性：
 
 ```bash
 ./scripts/visualize_scenes.sh \
-  --output output_model/scene_preview_uniform \
-  --num-scenes 12 \
-  --seed-start 3000
+  --output output_model/terrain_preview \
+  --num-scenes 6 \
+  --seed-start 7000
 ```
 
-每个场景输出 3D、XY、XZ、YZ 四个视图，并额外生成
-`overview_xy.png` 总览图和 `scene_summary.json`。
+每个场景输出 3D 地形、俯视等高线、起终点直线剖面，并额外生成
+`overview_terrain.png` 总览图和 `terrain_summary.json`。
 
 ## 实时播放单条轨迹
 

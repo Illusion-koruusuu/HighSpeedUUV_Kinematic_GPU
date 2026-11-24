@@ -8,7 +8,8 @@ from kinematic_uuv.teacher import teacher_action
 
 class KinematicEnvTests(unittest.TestCase):
     def test_default_goal_distance_and_bounds(self):
-        env = KinematicUUVEnv(obstacle_count_range=(0, 0))
+        env = KinematicUUVEnv(scene_type="spheres",
+                              obstacle_count_range=(0, 0))
         try:
             for seed in range(1000):
                 env.np_random = np.random.default_rng(seed)
@@ -27,12 +28,15 @@ class KinematicEnvTests(unittest.TestCase):
             self.assertEqual(observation["sonar"].shape, (6, 12, 48))
             self.assertEqual(observation["target"].shape, (4,))
             self.assertEqual(observation["path"].shape, (5,))
-            self.assertEqual(observation["motion"].shape, (7,))
+            self.assertEqual(observation["motion"].shape, (8,))
             self.assertLess(observation["target"][3], 1.0)
             for value in observation.values():
                 self.assertTrue(np.isfinite(value).all())
-            self.assertGreaterEqual(len(env.obstacles), env.obstacle_count_min)
-            self.assertLessEqual(len(env.obstacles), env.obstacle_count_max)
+            self.assertEqual(env.scene_type, "terrain")
+            self.assertIsNotNone(env.terrain)
+            self.assertEqual(len(env.obstacles), 0)
+            self.assertGreater(env.terrain.clearance(env.state["position"]), 0.0)
+            self.assertGreater(env.terrain.clearance(env.goal), 0.0)
         finally:
             env.close()
 
@@ -60,7 +64,7 @@ class KinematicEnvTests(unittest.TestCase):
             env.close()
 
     def test_default_scene_has_uniform_dense_obstacles(self):
-        env = KinematicUUVEnv(max_steps=20)
+        env = KinematicUUVEnv(max_steps=20, scene_type="spheres")
         try:
             env.reset(seed=0)
             obstacles = env.obstacles
@@ -72,6 +76,56 @@ class KinematicEnvTests(unittest.TestCase):
             self.assertGreater(np.ptp(centers[:, 1]), 250.0)
             self.assertGreater(np.ptp(centers[:, 2]), 30.0)
             self.assertTrue(np.isfinite(env._dijkstra_cost(start)))
+        finally:
+            env.close()
+
+    def test_default_scene_is_rugged_static_seabed(self):
+        env = KinematicUUVEnv(max_steps=20)
+        observation, _ = env.reset(seed=0)
+        before = env.terrain.height_grid.copy()
+        try:
+            self.assertGreater(
+                float(env.terrain.height_grid.max()
+                      - env.terrain.height_grid.min()),
+                20.0,
+            )
+            self.assertTrue(np.any(observation["sonar"][1::2] > 0.5))
+            x = 0.5 * (env.terrain.x_axis[0] + env.terrain.x_axis[-1])
+            y = 0.5 * (env.terrain.y_axis[0] + env.terrain.y_axis[-1])
+            surface = float(env.terrain.height(x, y))
+            hit, _ = env.terrain.segment_clearance(
+                [x, y, surface - 2.0],
+                [x, y, surface - 1.0],
+            )
+            self.assertTrue(hit)
+            env.step(teacher_action(observation))
+            np.testing.assert_allclose(env.terrain.height_grid, before)
+            self.assertEqual(env.obstacle_motion, "static")
+        finally:
+            env.close()
+
+    def test_depth_hold_observation_and_reward(self):
+        env = KinematicUUVEnv(
+            max_steps=5,
+            use_dijkstra=False,
+            include_path_observation=False,
+            reward_mode="euclidean",
+            include_depth_error_observation=True,
+            depth_hold_weight=0.2,
+            depth_hold_scale=10.0,
+        )
+        try:
+            observation, _ = env.reset(seed=0)
+            self.assertAlmostEqual(float(observation["motion"][7]), 0.0)
+            self.assertAlmostEqual(
+                float(env.goal[2]), float(env.state["position"][2])
+            )
+            env.state["position"][2] += 5.0
+            observation = env._observe()
+            self.assertAlmostEqual(float(observation["motion"][7]), 0.5)
+            _, _, _, _, info = env.step(np.zeros(3, dtype=np.float32))
+            self.assertGreater(info["depth_hold_error_m"], 4.0)
+            self.assertGreater(info["depth_hold_penalty"], 0.0)
         finally:
             env.close()
 
@@ -95,7 +149,8 @@ class KinematicEnvTests(unittest.TestCase):
             env.close()
 
     def test_default_obstacles_are_static(self):
-        env = KinematicUUVEnv(max_steps=20, obstacle_count_range=(20, 20))
+        env = KinematicUUVEnv(max_steps=20, scene_type="spheres",
+                              obstacle_count_range=(20, 20))
         observation, _ = env.reset(seed=0)
         before = np.asarray([center for center, _ in env.obstacles])
         try:
@@ -110,6 +165,7 @@ class KinematicEnvTests(unittest.TestCase):
     def test_random_obstacles_move_within_uuv_speed_limit(self):
         env = KinematicUUVEnv(
             max_steps=20,
+            scene_type="spheres",
             obstacle_count_range=(20, 20),
             obstacle_motion="random",
             obstacle_speed_range=(KNOT_MPS, 10.0 * KNOT_MPS),
@@ -132,6 +188,7 @@ class KinematicEnvTests(unittest.TestCase):
     def test_dynamic_obstacles_rebuild_dijkstra_periodically(self):
         env = KinematicUUVEnv(
             max_steps=20,
+            scene_type="spheres",
             obstacle_count_range=(20, 20),
             obstacle_motion="random",
             dijkstra_replan_steps=2,
